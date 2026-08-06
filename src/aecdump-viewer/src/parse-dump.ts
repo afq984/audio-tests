@@ -198,12 +198,6 @@ class SegmentBuilder {
       }
       const channelData = acc.channelAccumulators.map((c) => c.merged());
       const frames = channelData[0]?.length ?? 0;
-      // A render track starts wherever its first call landed in capture
-      // coordinates, which is a projection rather than a measured position.
-      const projectedStartFrame =
-        kind === 'reverse' && this.renderToCapture.length > 0
-          ? this.startFrame + this.renderToCapture[0]
-          : this.startFrame;
       tracks.push({
         kind,
         timeline: kind === 'reverse' ? 'render' : 'capture',
@@ -214,7 +208,11 @@ class SegmentBuilder {
         channels: acc.channels,
         channelData,
         startFrame: this.startFrame,
-        startTime: framesToSeconds(projectedStartFrame),
+        // Native position only. A render track is NOT projected onto capture
+        // coordinates here: the call order records serialization order, not
+        // clock measurements, so any warp is an estimate applied at display
+        // time through a TrackTransform.
+        startTime: framesToSeconds(this.startFrame),
         duration: frames / acc.sampleRate,
       });
     }

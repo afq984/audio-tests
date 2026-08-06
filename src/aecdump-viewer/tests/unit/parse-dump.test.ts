@@ -187,6 +187,11 @@ describe('capture-coordinate projection', () => {
     const reverse = segment.tracks.find((t) => t.kind === 'reverse')!;
     expect(reverse.channelData[0].length).toBe(3 * PER_FRAME);
     expect(reverse.timeline).toBe('render');
+
+    // The map is metadata, not an applied warp: the track keeps its native
+    // start, because call order records serialization order rather than a
+    // clock measurement. Placing it is a display-time decision.
+    expect(reverse.startTime).toBe(0);
   });
 
   it('labels capture-aligned tracks as such', () => {

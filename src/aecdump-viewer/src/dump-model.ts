@@ -57,10 +57,12 @@ export interface DumpTrack {
   /** Capture frame index where this track's segment begins. */
   startFrame: number;
   /**
-   * Seconds from the start of the capture timeline.
+   * Seconds from the start of this track's own clock.
    *
-   * For a `render` track this is a projection through renderToCaptureFrame,
-   * not a measured position -- see that field.
+   * This is a native position, never an estimate. Placing a `render` track
+   * against capture time is a display-time decision -- see TrackTransform in
+   * timeline.ts -- because the call order records the order events were
+   * serialized, not when either clock ticked.
    */
   startTime: number;
   /** Track duration in seconds, on its own timeline. */
