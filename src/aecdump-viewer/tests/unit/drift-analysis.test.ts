@@ -156,3 +156,69 @@ describe('analyzeDrift', () => {
     expect(results[1].points[0].captureFrame).toBe(10);
   });
 });
+
+describe('delivery block structure', () => {
+  it('detects 10ms capture against 40ms render', () => {
+    const result = analyzeCallOrder(callOrder(repeat('ccccrrrr', 750)));
+    expect(result.blocks.captureBlockFrames).toBe(4);
+    expect(result.blocks.renderBlockFrames).toBe(4);
+    expect(result.blocks.renderBlockMs).toBe(40);
+  });
+
+  it('reports one-frame blocks for a lockstep segment', () => {
+    const result = analyzeCallOrder(callOrder(repeat('rc', 100)));
+    expect(result.blocks).toMatchObject({
+      captureBlockFrames: 1,
+      renderBlockFrames: 1,
+      captureBlockMs: 10,
+      renderBlockMs: 10,
+    });
+  });
+
+  it('ignores a single odd run when inferring the block size', () => {
+    // One five-call render run among fours must not redefine the block size.
+    let calls = '';
+    for (let i = 0; i < 100; i++) calls += i === 50 ? 'ccccrrrrr' : 'ccccrrrr';
+    expect(analyzeCallOrder(callOrder(calls)).blocks.renderBlockFrames).toBe(4);
+  });
+});
+
+describe('block granularity is not drift', () => {
+  it('reports no discontinuities for healthy block-mismatched audio', () => {
+    // 30s of 10ms capture against 40ms render, no clock drift at all. Drift
+    // sawtooths between -10ms and -40ms purely from buffering; a window that
+    // does not span whole periods reads every cycle as a step.
+    const result = analyzeCallOrder(callOrder(repeat('ccccrrrr', 750)));
+    expect(result.discontinuities).toEqual([]);
+  });
+
+  it('derives a window that spans whole capture blocks', () => {
+    const result = analyzeCallOrder(callOrder(repeat('ccccrrrr', 750)));
+    expect(result.discontinuityWindowFrames % result.blocks.captureBlockFrames).toBe(0);
+    expect(result.discontinuityWindowFrames).toBeGreaterThanOrEqual(4);
+  });
+
+  it('still sees genuine drift underneath the block pattern', () => {
+    // An extra render frame every 25 blocks: real drift of ~600ms per minute.
+    let calls = '';
+    for (let i = 0; i < 750; i++) calls += i % 25 === 0 ? 'ccccrrrrr' : 'ccccrrrr';
+    const result = analyzeCallOrder(callOrder(calls));
+    expect(result.driftMsPerMinute).toBeGreaterThan(400);
+    // Gradual drift is a slope, not a sequence of steps.
+    expect(result.discontinuities).toEqual([]);
+  });
+
+  it('still catches a real gap in block-mismatched audio', () => {
+    // Same block structure, but render stops for two whole blocks.
+    const result = analyzeCallOrder(
+      callOrder(repeat('ccccrrrr', 100) + repeat('cccc', 2) + repeat('ccccrrrr', 100))
+    );
+    expect(result.discontinuities.length).toBeGreaterThan(0);
+    expect(result.discontinuities.every((d) => d.stepMs < 0)).toBe(true);
+  });
+
+  it('keeps the lockstep window at the previous default', () => {
+    const result = analyzeCallOrder(callOrder(repeat('rc', 100)));
+    expect(result.discontinuityWindowFrames).toBe(5);
+  });
+});

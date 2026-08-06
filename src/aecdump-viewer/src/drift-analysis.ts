@@ -39,8 +39,33 @@ export interface DriftDiscontinuity {
   stepMs: number;
 }
 
+/**
+ * How each stream is delivered to APM.
+ *
+ * APM always processes 10ms frames, but a caller holding larger buffers calls
+ * it several times in a row -- a 40ms render buffer produces four render calls
+ * back to back. That shows up in the call order as runs (`ccccrrrr`) and is
+ * worth reporting on its own: "render arrives in 40ms blocks while capture is
+ * 10ms" is a fact about the audio stack, not a fault.
+ *
+ * It also has to be measured before drift can be, because block granularity
+ * looks exactly like drift if you sample naively.
+ */
+export interface BlockStructure {
+  /** Capture calls per delivery block. 1 means one frame at a time. */
+  captureBlockFrames: number;
+  /** Render calls per delivery block. */
+  renderBlockFrames: number;
+  /** Block durations in ms, for display. */
+  captureBlockMs: number;
+  renderBlockMs: number;
+}
+
 export interface DriftAnalysis {
   startFrame: number;
+  blocks: BlockStructure;
+  /** Capture frames the discontinuity window actually spanned. */
+  discontinuityWindowFrames: number;
   /** One point per capture call, in order. */
   points: DriftPoint[];
   discontinuities: DriftDiscontinuity[];
@@ -62,7 +87,9 @@ export interface DriftOptions {
    */
   discontinuityThresholdMs?: number;
   /**
-   * Capture frames the change is measured across.
+   * Capture frames the change is measured across. Defaults to a multiple of
+   * the detected capture block size, which is what keeps block granularity out
+   * of the result -- see analyzeCallOrder.
    *
    * Measuring across a window rather than between adjacent frames is what
    * separates a step from a slope. A gap spread over several frames shifts
@@ -71,6 +98,8 @@ export interface DriftOptions {
    * window, so it does not trip the threshold.
    */
   discontinuityWindowFrames?: number;
+  /** Smallest window to use when deriving one from the block size. */
+  minimumWindowFrames?: number;
   /** Below this span the slope is not reported. */
   minimumSpanSeconds?: number;
 }
@@ -85,10 +114,22 @@ export function analyzeCallOrder(
   segment: CallOrderSegment,
   {
     discontinuityThresholdMs = 2 * FRAME_MS,
-    discontinuityWindowFrames = 5,
+    discontinuityWindowFrames,
+    minimumWindowFrames = 5,
     minimumSpanSeconds = 1,
   }: DriftOptions = {}
 ): DriftAnalysis {
+  const blocks = detectBlockStructure(segment.calls);
+  // The drift series is sampled once per capture call, so a capture block of N
+  // frames makes it sawtooth with period N: render sits up to N frames behind
+  // purely because of buffering, and catches up when the next render block
+  // lands. Spanning a whole number of those periods cancels the sawtooth
+  // exactly, leaving only real movement. A window that is not a multiple of
+  // the period straddles the wrap and reads every cycle as a step.
+  const window =
+    discontinuityWindowFrames ??
+    blocks.captureBlockFrames * Math.ceil(minimumWindowFrames / blocks.captureBlockFrames);
+
   const points: DriftPoint[] = [];
 
   let renderFrames = 0;
@@ -119,11 +160,7 @@ export function analyzeCallOrder(
     });
   }
 
-  const discontinuities = findDiscontinuities(
-    points,
-    discontinuityThresholdMs,
-    discontinuityWindowFrames
-  );
+  const discontinuities = findDiscontinuities(points, discontinuityThresholdMs, window);
 
   const first = points[0];
   const last = points[points.length - 1];
@@ -134,12 +171,56 @@ export function analyzeCallOrder(
 
   return {
     startFrame: segment.startFrame,
+    blocks,
+    discontinuityWindowFrames: window,
     points,
     discontinuities,
     totalDriftMs,
     driftMsPerMinute,
     leadingRenderFrames,
   };
+}
+
+/**
+ * Infers the delivery block size of each stream from runs in the call order.
+ *
+ * Uses the most common run length rather than the longest: a single odd run --
+ * an extra render call where the clocks slipped, say -- should not redefine the
+ * block size for the whole segment.
+ */
+export function detectBlockStructure(calls: Uint8Array): BlockStructure {
+  const captureBlockFrames = modalRunLength(calls, CALL_CAPTURE);
+  const renderBlockFrames = modalRunLength(calls, CALL_RENDER);
+  return {
+    captureBlockFrames,
+    renderBlockFrames,
+    captureBlockMs: captureBlockFrames * FRAME_MS,
+    renderBlockMs: renderBlockFrames * FRAME_MS,
+  };
+}
+
+function modalRunLength(calls: Uint8Array, call: number): number {
+  const tally = new Map<number, number>();
+  let run = 0;
+  for (let i = 0; i <= calls.length; i++) {
+    if (i < calls.length && calls[i] === call) {
+      run++;
+      continue;
+    }
+    if (run > 0) tally.set(run, (tally.get(run) ?? 0) + 1);
+    run = 0;
+  }
+
+  let best = 1;
+  let bestCount = 0;
+  for (const [length, count] of tally) {
+    // Ties go to the shorter run, which yields the smaller window.
+    if (count > bestCount || (count === bestCount && length < best)) {
+      best = length;
+      bestCount = count;
+    }
+  }
+  return best;
 }
 
 /**
