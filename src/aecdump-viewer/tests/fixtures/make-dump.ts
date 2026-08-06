@@ -52,16 +52,28 @@ function floatPayload(samples: number, seed: number): Uint8Array {
   return new Uint8Array(floats.buffer);
 }
 
-function initMessage(sampleRate: number, channels: number): Uint8Array {
+export interface InitFormat {
+  sampleRate?: number;
+  channels?: number;
+  /** Defaults to sampleRate when omitted, matching how dumps usually look. */
+  reverseSampleRate?: number;
+  outputSampleRate?: number;
+  timestampMs?: number;
+}
+
+function initMessage(format: InitFormat): Uint8Array {
+  const sampleRate = format.sampleRate ?? 16000;
+  const channels = format.channels ?? 1;
   return frameMessage({
     type: Event.Type.INIT,
     init: {
       sampleRate,
-      outputSampleRate: sampleRate,
-      reverseSampleRate: sampleRate,
+      outputSampleRate: format.outputSampleRate ?? sampleRate,
+      reverseSampleRate: format.reverseSampleRate ?? sampleRate,
       numInputChannels: channels,
       numOutputChannels: channels,
       numReverseChannels: channels,
+      ...(format.timestampMs === undefined ? {} : { timestampMs: format.timestampMs }),
     },
   });
 }
@@ -85,7 +97,7 @@ export function makeInt16Dump({
   channels = 1,
 }: DumpOptions = {}): ArrayBuffer {
   const perFrame = samplesPerFrame(sampleRate);
-  const parts = [initMessage(sampleRate, channels)];
+  const parts = [initMessage({ sampleRate, channels })];
   for (let i = 0; i < frames; i++) {
     parts.push(
       frameMessage({
@@ -123,7 +135,7 @@ export function makeFloatDump({
   dropInput = [],
 }: FloatDumpOptions = {}): ArrayBuffer {
   const perFrame = samplesPerFrame(sampleRate);
-  const parts = [initMessage(sampleRate, channels)];
+  const parts = [initMessage({ sampleRate, channels })];
   for (let i = 0; i < frames; i++) {
     const stream: webrtc.audioproc.IStream = { delay: 40 };
     if (!dropInput.includes(i)) {
@@ -139,6 +151,78 @@ export function makeFloatDump({
     parts.push(frameMessage({ type: Event.Type.STREAM, stream }));
   }
   return concat(parts);
+}
+
+export interface SegmentSpec extends InitFormat {
+  /** Capture frames (STREAM events) this segment contributes. */
+  frames: number;
+  /** Emit one REVERSE_STREAM per capture frame. Defaults to true. */
+  reverse?: boolean;
+}
+
+/**
+ * Multi-INIT dump: each spec contributes an INIT followed by its capture
+ * frames. The capture frame counter runs across the whole dump rather than
+ * resetting per segment, matching unpack.cc, so a segment's start frame is the
+ * sum of all preceding segments' frames -- which is also the suffix
+ * unpack_aecdump would put in its filenames.
+ */
+export function makeSegmentedDump(
+  specs: SegmentSpec[],
+  { float = true }: { float?: boolean } = {}
+): ArrayBuffer {
+  const parts: Uint8Array[] = [];
+  let frameCounter = 0;
+
+  for (const spec of specs) {
+    const sampleRate = spec.sampleRate ?? 16000;
+    const channels = spec.channels ?? 1;
+    const reverseRate = spec.reverseSampleRate ?? sampleRate;
+    const outputRate = spec.outputSampleRate ?? sampleRate;
+    parts.push(initMessage(spec));
+
+    for (let i = 0; i < spec.frames; i++) {
+      const seed = frameCounter;
+      if (spec.reverse !== false) {
+        const perReverse = samplesPerFrame(reverseRate);
+        parts.push(
+          frameMessage({
+            type: Event.Type.REVERSE_STREAM,
+            reverseStream: float
+              ? { channel: channelPayloads(perReverse, channels, seed) }
+              : { data: int16Payload(perReverse, channels, seed) },
+          })
+        );
+      }
+
+      const perInput = samplesPerFrame(sampleRate);
+      const perOutput = samplesPerFrame(outputRate);
+      parts.push(
+        frameMessage({
+          type: Event.Type.STREAM,
+          stream: float
+            ? {
+                inputChannel: channelPayloads(perInput, channels, seed + 100),
+                outputChannel: channelPayloads(perOutput, channels, seed + 200),
+                delay: 40,
+              }
+            : {
+                inputData: int16Payload(perInput, channels, seed + 100),
+                outputData: int16Payload(perOutput, channels, seed + 200),
+                delay: 40,
+              },
+        })
+      );
+      frameCounter++;
+    }
+  }
+
+  return concat(parts);
+}
+
+/** One deinterleaved float payload per channel. */
+function channelPayloads(samples: number, channels: number, seed: number): Uint8Array[] {
+  return Array.from({ length: channels }, (_, c) => floatPayload(samples, seed + c * 7));
 }
 
 /**
