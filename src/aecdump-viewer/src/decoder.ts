@@ -1,6 +1,10 @@
-import { webrtc } from './proto/debug.js';
-
-const Event = webrtc.audioproc.Event;
+/**
+ * Transitional adapter from the segment model to the flat three-stream shape
+ * the V1 UI consumes. New code should use parseDump() and the segment model
+ * directly; this exists so the app keeps working while the UI catches up.
+ */
+import { DumpSegment, TrackKind } from './dump-model.js';
+import { parseDump } from './parse-dump.js';
 
 export interface ParsedAudioStream {
   sampleRate: number;
@@ -14,242 +18,48 @@ export interface DecoderResult {
   output: ParsedAudioStream;
 }
 
-class ChannelAccumulator {
-  private chunks: Float32Array[] = [];
-  private totalLength = 0;
+const EMPTY: ParsedAudioStream = { sampleRate: 16000, channels: 1, channelData: [] };
 
-  append(chunk: Float32Array) {
-    this.chunks.push(chunk);
-    this.totalLength += chunk.length;
-  }
-
-  get length() {
-    return this.totalLength;
-  }
-
-  getMerged(): Float32Array {
-    const merged = new Float32Array(this.totalLength);
-    let offset = 0;
-    for (const chunk of this.chunks) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return merged;
-  }
-}
-
-class StreamAccumulator {
-  public accumulators: ChannelAccumulator[] = [];
-  public sampleRate = 0;
-  public channels = 0;
-
-  init(sampleRate: number, channels: number) {
-    if (this.sampleRate === 0) {
-      this.sampleRate = sampleRate;
-      this.channels = channels;
-      this.accumulators = Array.from({ length: channels }, () => new ChannelAccumulator());
-    } else if (this.sampleRate !== sampleRate || this.channels !== channels) {
-      console.warn(
-        `StreamAccumulator: Audio format changed mid-dump! ` +
-        `Old: ${this.sampleRate}Hz/${this.channels}ch, ` +
-        `New: ${sampleRate}Hz/${channels}ch. V1 ignores mid-dump format changes.`
-      );
-    }
-  }
-
-  /** Samples per channel in one APM frame; upstream fixes this at 10ms. */
-  get samplesPerFrame() {
-    return Math.round(this.sampleRate / 100);
-  }
-
-  /** Whether this stream carried any data at all. */
-  get hasData() {
-    return this.accumulators.some((acc) => acc.length > 0);
-  }
-
-  /**
-   * Pads every channel with silence up to `targetLength`. Called before
-   * appending a chunk so the chunk lands at its true position on the capture
-   * timeline even if earlier frames omitted this stream.
-   */
-  padTo(targetLength: number) {
-    if (this.channels === 0) return;
-    for (const acc of this.accumulators) {
-      const missing = targetLength - acc.length;
-      if (missing > 0) acc.append(new Float32Array(missing));
-    }
-  }
-
-  appendInterleavedInt16(bytes: Uint8Array) {
-    if (this.channels === 0) return;
-    // protobufjs hands back a view into the dump buffer at an arbitrary
-    // byteOffset, but Int16Array requires 2-byte alignment. Copy when needed.
-    let int16: Int16Array;
-    if (bytes.byteOffset % 2 === 0) {
-      int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1);
-    } else {
-      const copy = new Uint8Array(bytes.byteLength);
-      copy.set(bytes);
-      int16 = new Int16Array(copy.buffer, 0, copy.byteLength >> 1);
-    }
-    // Drop any trailing partial frame rather than failing the whole parse.
-    const numSamples = Math.floor(int16.length / this.channels);
-    
-    // Temporary chunks for each channel
-    const chunks = Array.from({ length: this.channels }, () => new Float32Array(numSamples));
-    
-    let index = 0;
-    for (let i = 0; i < numSamples; i++) {
-      for (let c = 0; c < this.channels; c++) {
-        chunks[c][i] = int16[index++] / 32768.0;
-      }
-    }
-
-    for (let c = 0; c < this.channels; c++) {
-      this.accumulators[c].append(chunks[c]);
-    }
-  }
-
-  appendDeinterleavedFloat(channelsBytes: Uint8Array[]) {
-    if (this.channels === 0) return;
-    const actualChannels = Math.min(this.channels, channelsBytes.length);
-    for (let c = 0; c < actualChannels; c++) {
-      const bytes = channelsBytes[c];
-      let floatData: Float32Array;
-      if (bytes.byteOffset % 4 === 0) {
-        floatData = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
-      } else {
-        const copy = new Uint8Array(bytes.byteLength);
-        copy.set(bytes);
-        floatData = new Float32Array(copy.buffer, 0, copy.byteLength / 4);
-      }
-      this.accumulators[c].append(floatData);
-    }
-  }
-
-  toParsedStream(): ParsedAudioStream {
-    return {
-      sampleRate: this.sampleRate || 16000, // fallback
-      channels: this.channels || 1,
-      channelData: this.accumulators.map((acc) => acc.getMerged()),
-    };
-  }
+function streamFrom(segment: DumpSegment | undefined, kind: TrackKind): ParsedAudioStream {
+  if (!segment) return EMPTY;
+  const format = segment.formats[kind];
+  const track = segment.tracks.find((t) => t.kind === kind);
+  return {
+    sampleRate: format.sampleRate,
+    channels: format.channels,
+    // A stream that never carried data has no track. The V1 shape still
+    // expects one entry per channel, so give it empty ones -- callers test
+    // channelData[0].length, not just the list length.
+    channelData: track
+      ? track.channelData
+      : Array.from({ length: format.channels }, () => new Float32Array(0)),
+  };
 }
 
 export function parseAecDump(arrayBuffer: ArrayBuffer): DecoderResult {
-  const view = new DataView(arrayBuffer);
-  let offset = 0;
-
-  const refAcc = new StreamAccumulator();
-  const inputAcc = new StreamAccumulator();
-  const outputAcc = new StreamAccumulator();
-
-  let eventCount = 0;
-  let captureFrameCount = 0;
-
-  while (offset < arrayBuffer.byteLength) {
-    if (offset + 4 > arrayBuffer.byteLength) {
-      console.warn('parseAecDump: Unexpected EOF while reading message size.');
-      break;
-    }
-    const size = view.getInt32(offset, true);
-    offset += 4;
-
-    if (offset + size > arrayBuffer.byteLength) {
-      console.warn('parseAecDump: Unexpected EOF while reading message payload.');
-      break;
-    }
-
-    const eventBytes = new Uint8Array(arrayBuffer, offset, size);
-    offset += size;
-
-    let event: webrtc.audioproc.Event;
-    try {
-      event = Event.decode(eventBytes);
-    } catch (e) {
-      console.error(`parseAecDump: Failed to decode event #${eventCount} at offset ${offset - size - 4}:`, e);
-      continue;
-    }
-
-    eventCount++;
-
-    switch (event.type) {
-      case Event.Type.INIT: {
-        const init = event.init;
-        if (!init) break;
-        
-        const sampleRate = init.sampleRate || 16000;
-        const reverseSampleRate = init.reverseSampleRate || sampleRate;
-        const outputSampleRate = init.outputSampleRate || sampleRate;
-
-        const inputChannels = init.numInputChannels || 1;
-        const outputChannels = init.numOutputChannels || 1;
-        const reverseChannels = init.numReverseChannels || 1;
-
-        refAcc.init(reverseSampleRate, reverseChannels);
-        inputAcc.init(sampleRate, inputChannels);
-        outputAcc.init(outputSampleRate, outputChannels);
-        break;
-      }
-
-      case Event.Type.REVERSE_STREAM: {
-        const rev = event.reverseStream;
-        if (!rev) break;
-
-        if (rev.data && rev.data.length > 0) {
-          refAcc.appendInterleavedInt16(rev.data);
-        } else if (rev.channel && rev.channel.length > 0) {
-          refAcc.appendDeinterleavedFloat(rev.channel);
-        }
-        break;
-      }
-
-      case Event.Type.STREAM: {
-        const stream = event.stream;
-        if (!stream) break;
-
-        // Each STREAM event is one 10ms capture frame. Pad both streams up to
-        // this frame's position before appending, so an event that carries only
-        // one of them does not shift everything after it out of lockstep.
-        const frameIndex = captureFrameCount++;
-
-        // Input
-        if (stream.inputData && stream.inputData.length > 0) {
-          inputAcc.padTo(frameIndex * inputAcc.samplesPerFrame);
-          inputAcc.appendInterleavedInt16(stream.inputData);
-        } else if (stream.inputChannel && stream.inputChannel.length > 0) {
-          inputAcc.padTo(frameIndex * inputAcc.samplesPerFrame);
-          inputAcc.appendDeinterleavedFloat(stream.inputChannel);
-        }
-
-        // Output
-        if (stream.outputData && stream.outputData.length > 0) {
-          outputAcc.padTo(frameIndex * outputAcc.samplesPerFrame);
-          outputAcc.appendInterleavedInt16(stream.outputData);
-        } else if (stream.outputChannel && stream.outputChannel.length > 0) {
-          outputAcc.padTo(frameIndex * outputAcc.samplesPerFrame);
-          outputAcc.appendDeinterleavedFloat(stream.outputChannel);
-        }
-        break;
-      }
-
-      default:
-        // Config, RuntimeSetting, Unknown are ignored in V1 decoder
-        break;
-    }
+  const dump = parseDump(arrayBuffer);
+  for (const warning of dump.warnings) {
+    console.warn(`parseAecDump: ${warning}`);
   }
 
-  // Padding happens before an append, so a stream whose *last* frames were
-  // missing would end short rather than out of position. Extend both to the
-  // full capture timeline, leaving a stream that never appeared empty.
-  if (inputAcc.hasData) inputAcc.padTo(captureFrameCount * inputAcc.samplesPerFrame);
-  if (outputAcc.hasData) outputAcc.padTo(captureFrameCount * outputAcc.samplesPerFrame);
+  // V1 has no way to show more than one format, so it shows the first segment.
+  // Previously a re-INIT was ignored and the following audio was concatenated
+  // at the old rate, which silently corrupted the timeline; showing one intact
+  // segment is at least coherent. The segment model is the real fix.
+  if (dump.segments.length > 1) {
+    console.warn(
+      `parseAecDump: dump has ${dump.segments.length} segments (the format changes mid-dump); ` +
+        `showing the first. Segments start at capture frames ` +
+        `${dump.segments.map((s) => s.startFrame).join(', ')}.`
+    );
+  }
 
-  console.log(`parseAecDump: Successfully parsed ${eventCount} events.`);
+  const first = dump.segments[0];
+  console.log(`parseAecDump: Successfully parsed ${dump.eventCount} events.`);
 
   return {
-    reference: refAcc.toParsedStream(),
-    input: inputAcc.toParsedStream(),
-    output: outputAcc.toParsedStream(),
+    reference: streamFrom(first, 'reverse'),
+    input: streamFrom(first, 'input'),
+    output: streamFrom(first, 'ref_out'),
   };
 }
