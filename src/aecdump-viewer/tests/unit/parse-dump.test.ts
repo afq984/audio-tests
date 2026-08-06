@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { parseDump } from '../../src/parse-dump.js';
 import { allTracks, dumpDuration, framesToSeconds } from '../../src/dump-model.js';
 import {
+  makeCallOrderDump,
   makeSegmentedDump,
   makeFloatDump,
   makeInt16Dump,
@@ -167,5 +168,49 @@ describe('framesToSeconds', () => {
   it('treats a frame as 10ms', () => {
     expect(framesToSeconds(100)).toBeCloseTo(1.0, 9);
     expect(framesToSeconds(1)).toBeCloseTo(0.01, 9);
+  });
+});
+
+describe('capture-coordinate projection', () => {
+  it('maps an irregular interleaving without touching the audio', () => {
+    // The reverse stream runs on its own hardware clock, so an order like
+    // crrccr is ordinary jitter rather than a fault.
+    const dump = parseDump(makeCallOrderDump('crrccr'));
+    const segment = dump.segments[0];
+
+    // Two render calls land inside one capture interval, then one arrives
+    // after two more captures.
+    expect(Array.from(segment.renderToCaptureFrame!)).toEqual([1, 1, 3]);
+
+    // Three render calls means three frames of samples: no silence is injected
+    // to drag the render stream onto the capture clock.
+    const reverse = segment.tracks.find((t) => t.kind === 'reverse')!;
+    expect(reverse.channelData[0].length).toBe(3 * PER_FRAME);
+    expect(reverse.timeline).toBe('render');
+  });
+
+  it('labels capture-aligned tracks as such', () => {
+    const dump = parseDump(makeCallOrderDump('rcrc'));
+    const kinds = Object.fromEntries(
+      dump.segments[0].tracks.map((t) => [t.kind, t.timeline])
+    );
+    expect(kinds).toEqual({ reverse: 'render', input: 'capture', ref_out: 'capture' });
+  });
+
+  it('ties a render call to the capture that follows it, not the one before', () => {
+    // Leading render calls precede any capture, so they map to 0.
+    const dump = parseDump(makeCallOrderDump('rrcc'));
+    expect(Array.from(dump.segments[0].renderToCaptureFrame!)).toEqual([0, 0]);
+  });
+
+  it('is null for a segment with no render calls', () => {
+    const dump = parseDump(makeCallOrderDump('cccc'));
+    expect(dump.segments[0].renderToCaptureFrame).toBeNull();
+  });
+
+  it('counts capture frames from the segment start, not the dump start', () => {
+    const dump = parseDump(makeCallOrderDump('cccc'));
+    expect(dump.segments[0].startFrame).toBe(0);
+    expect(dump.captureFrameCount).toBe(4);
   });
 });

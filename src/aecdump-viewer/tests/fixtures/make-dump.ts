@@ -305,6 +305,41 @@ export function makeMetadataDump({
   return concat(parts);
 }
 
+/**
+ * Dump built from a literal call-order string such as 'crrccr' -- 'r' for a
+ * render call, 'c' for a capture call. For exercising interleavings that the
+ * regular one-render-per-capture fixtures cannot express, which is the normal
+ * case when the two streams run on separate hardware clocks.
+ */
+export function makeCallOrderDump(order: string, sampleRate = 16000): ArrayBuffer {
+  const perFrame = samplesPerFrame(sampleRate);
+  const parts = [initMessage({ sampleRate, channels: 1 })];
+  let seed = 0;
+  for (const call of order) {
+    if (call === 'r') {
+      parts.push(
+        frameMessage({
+          type: Event.Type.REVERSE_STREAM,
+          reverseStream: { channel: [floatPayload(perFrame, seed++)] },
+        })
+      );
+    } else {
+      parts.push(
+        frameMessage({
+          type: Event.Type.STREAM,
+          stream: {
+            inputChannel: [floatPayload(perFrame, seed + 100)],
+            outputChannel: [floatPayload(perFrame, seed + 200)],
+            delay: 40,
+          },
+        })
+      );
+      seed++;
+    }
+  }
+  return concat(parts);
+}
+
 export interface RawDumpOptions {
   /** Written verbatim, so a test can express a malformed or partial INIT. */
   init: webrtc.audioproc.IInit;

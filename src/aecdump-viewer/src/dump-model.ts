@@ -25,8 +25,19 @@ export const FRAMES_PER_SECOND = 1000 / FRAME_MS;
  */
 export type TrackKind = 'reverse' | 'input' | 'ref_out';
 
+/**
+ * Which clock a track's samples are laid out against.
+ *
+ * `capture` tracks are positioned on the capture timeline directly. `render`
+ * tracks are not: the reverse stream is driven by its own hardware clock, so
+ * its samples are stored as they arrived and are projected onto capture
+ * coordinates through the segment's renderToCaptureFrame map.
+ */
+export type TrackTimeline = 'capture' | 'render';
+
 export interface DumpTrack {
   kind: TrackKind;
+  timeline: TrackTimeline;
   /**
    * Stable identity, unique within a dump.
    *
@@ -43,11 +54,16 @@ export interface DumpTrack {
   channels: number;
   /** One Float32Array per channel, samples in [-1, 1]. */
   channelData: Float32Array[];
-  /** Capture frame index where this track begins. */
+  /** Capture frame index where this track's segment begins. */
   startFrame: number;
-  /** Seconds from the start of the dump's capture timeline. */
+  /**
+   * Seconds from the start of the capture timeline.
+   *
+   * For a `render` track this is a projection through renderToCaptureFrame,
+   * not a measured position -- see that field.
+   */
   startTime: number;
-  /** Track duration in seconds. */
+  /** Track duration in seconds, on its own timeline. */
   duration: number;
 }
 
@@ -68,6 +84,25 @@ export interface DumpSegment {
   formats: Record<TrackKind, SegmentFormat>;
   /** Only streams that carried data; a stream that never appeared is absent. */
   tracks: DumpTrack[];
+  /**
+   * Capture-coordinate projection for the render stream, indexed by the
+   * segment's render frame: `renderToCaptureFrame[k]` is the number of capture
+   * calls that had **completed before** render call k was written.
+   *
+   * This is an ordinal relationship recovered from the order events appear in
+   * the file, not clock synchronization. The two streams run on separate
+   * hardware clocks, so an interleaving like `crrccr` is ordinary jitter: for
+   * that sequence the map is [1, 1, 3] -- two render calls landing inside the
+   * same capture interval, then one after two more captures.
+   *
+   * Consequences for consumers:
+   *   - it is monotonic but not strictly so, so seeking by capture frame needs
+   *     a tie-break rule
+   *   - any smoothing or interpolation across it is a display policy, not
+   *     recovered truth; store it raw and smooth at the point of drawing
+   *   - null when the segment carried no render calls
+   */
+  renderToCaptureFrame: Int32Array | null;
 }
 
 /**

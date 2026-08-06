@@ -159,6 +159,11 @@ class SegmentBuilder {
   readonly accumulators: Record<TrackKind, StreamAccumulator>;
   /** Render/capture call order, one char code per event, in file order. */
   readonly calls: number[] = [];
+  /**
+   * Capture calls completed before each render call in this segment; index is
+   * the render frame. See DumpSegment.renderToCaptureFrame.
+   */
+  readonly renderToCapture: number[] = [];
   frameCount = 0;
 
   constructor(
@@ -193,8 +198,15 @@ class SegmentBuilder {
       }
       const channelData = acc.channelAccumulators.map((c) => c.merged());
       const frames = channelData[0]?.length ?? 0;
+      // A render track starts wherever its first call landed in capture
+      // coordinates, which is a projection rather than a measured position.
+      const projectedStartFrame =
+        kind === 'reverse' && this.renderToCapture.length > 0
+          ? this.startFrame + this.renderToCapture[0]
+          : this.startFrame;
       tracks.push({
         kind,
+        timeline: kind === 'reverse' ? 'render' : 'capture',
         id: `init${this.initIndex}:${kind}`,
         name: `${TRACK_PREFIX[kind]}${this.startFrame}.wav`,
         initIndex: this.initIndex,
@@ -202,7 +214,7 @@ class SegmentBuilder {
         channels: acc.channels,
         channelData,
         startFrame: this.startFrame,
-        startTime: framesToSeconds(this.startFrame),
+        startTime: framesToSeconds(projectedStartFrame),
         duration: frames / acc.sampleRate,
       });
     }
@@ -213,6 +225,8 @@ class SegmentBuilder {
       frameCount: this.frameCount,
       timestampMs: this.timestampMs,
       formats: this.formats,
+      renderToCaptureFrame:
+        this.renderToCapture.length > 0 ? Int32Array.from(this.renderToCapture) : null,
       tracks,
     };
   }
@@ -478,6 +492,10 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         const rev = event.reverseStream;
         if (!rev || !current) break;
         current.calls.push(CALL_RENDER);
+        // Capture calls completed *before* this render call. Recording it
+        // before appending fixes the boundary convention: a render call that
+        // arrives between capture N-1 and N is tied to N, not to N-1.
+        current.renderToCapture.push(captureFrameCount - current.startFrame);
         const acc = current.accumulators.reverse;
         if (rev.data && rev.data.length > 0) {
           acc.appendInterleavedInt16(rev.data);
