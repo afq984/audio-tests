@@ -27,8 +27,18 @@ export type TrackKind = 'reverse' | 'input' | 'ref_out';
 
 export interface DumpTrack {
   kind: TrackKind;
-  /** unpack_aecdump-style name, e.g. `input1200.wav`. */
+  /**
+   * Stable identity, unique within a dump.
+   *
+   * `name` is not safe for this: two INITs separated by no capture frames
+   * produce the same suffix and therefore the same filename. Key UI state on
+   * `id` and show `name`.
+   */
+  id: string;
+  /** unpack_aecdump-style display and export name, e.g. `input1200.wav`. */
   name: string;
+  /** 1-based INIT index of the segment this track belongs to. */
+  initIndex: number;
   sampleRate: number;
   channels: number;
   /** One Float32Array per channel, samples in [-1, 1]. */

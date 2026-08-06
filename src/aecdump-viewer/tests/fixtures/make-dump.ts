@@ -158,6 +158,13 @@ export interface SegmentSpec extends InitFormat {
   frames: number;
   /** Emit one REVERSE_STREAM per capture frame. Defaults to true. */
   reverse?: boolean;
+  /**
+   * REVERSE_STREAM events emitted before this segment's capture frames, with
+   * no capture call of their own. A segment made only of these advances no
+   * capture frames, so the next segment starts at the same frame -- which is
+   * how two segments end up with the same unpack-style filename.
+   */
+  reverseOnlyFrames?: number;
 }
 
 /**
@@ -180,6 +187,17 @@ export function makeSegmentedDump(
     const reverseRate = spec.reverseSampleRate ?? sampleRate;
     const outputRate = spec.outputSampleRate ?? sampleRate;
     parts.push(initMessage(spec));
+
+    for (let i = 0; i < (spec.reverseOnlyFrames ?? 0); i++) {
+      parts.push(
+        frameMessage({
+          type: Event.Type.REVERSE_STREAM,
+          reverseStream: float
+            ? { channel: channelPayloads(samplesPerFrame(reverseRate), channels, i) }
+            : { data: int16Payload(samplesPerFrame(reverseRate), channels, i) },
+        })
+      );
+    }
 
     for (let i = 0; i < spec.frames; i++) {
       const seed = frameCounter;
@@ -284,6 +302,47 @@ export function makeMetadataDump({
     parts.push(frameMessage({ type: Event.Type.STREAM, stream }));
   }
 
+  return concat(parts);
+}
+
+export interface RawDumpOptions {
+  /** Written verbatim, so a test can express a malformed or partial INIT. */
+  init: webrtc.audioproc.IInit;
+  frames?: number;
+}
+
+/**
+ * Dump built from a raw INIT message, for exercising how the parser reacts to
+ * values a real dump should never contain.
+ *
+ * Payloads are always mono and sized from the declared capture rate (falling
+ * back to 16kHz), independent of the declared channel count -- a fixture should
+ * not try to allocate whatever nonsense the INIT claims.
+ */
+export function makeRawDump({ init, frames = 4 }: RawDumpOptions): ArrayBuffer {
+  const declared = init.sampleRate ?? 0;
+  const rate = declared >= 1000 && declared <= 384000 ? declared : 16000;
+  const perFrame = Math.max(1, Math.floor(rate / 100));
+  const parts = [frameMessage({ type: Event.Type.INIT, init })];
+
+  for (let i = 0; i < frames; i++) {
+    parts.push(
+      frameMessage({
+        type: Event.Type.REVERSE_STREAM,
+        reverseStream: { channel: [floatPayload(perFrame, i)] },
+      })
+    );
+    parts.push(
+      frameMessage({
+        type: Event.Type.STREAM,
+        stream: {
+          inputChannel: [floatPayload(perFrame, i + 100)],
+          outputChannel: [floatPayload(perFrame, i + 200)],
+          delay: 40,
+        },
+      })
+    );
+  }
   return concat(parts);
 }
 

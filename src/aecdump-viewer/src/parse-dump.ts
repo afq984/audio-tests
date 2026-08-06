@@ -93,7 +93,10 @@ class StreamAccumulator {
   }
 
   get samplesPerFrame() {
-    return Math.round(this.sampleRate / FRAMES_PER_SECOND);
+    // Truncate, because unpack.cc computes this with C++ integer division
+    // (`sample_rate / 100`). Only matters for rates that are not a multiple of
+    // 100, which APM does not use, but divergence here would be silent.
+    return Math.floor(this.sampleRate / FRAMES_PER_SECOND);
   }
 
   get hasData() {
@@ -192,7 +195,9 @@ class SegmentBuilder {
       const frames = channelData[0]?.length ?? 0;
       tracks.push({
         kind,
+        id: `init${this.initIndex}:${kind}`,
         name: `${TRACK_PREFIX[kind]}${this.startFrame}.wav`,
+        initIndex: this.initIndex,
         sampleRate: acc.sampleRate,
         channels: acc.channels,
         channelData,
@@ -282,22 +287,73 @@ function presentFields(message: object, fields: string[]): Array<[string, string
   return detail;
 }
 
-function formatsFromInit(init: webrtc.audioproc.IInit): Record<TrackKind, SegmentFormat> {
-  const sampleRate = init.sampleRate || 16000;
+/** Rates APM could plausibly run at; outside this an INIT is not believable. */
+const MIN_SAMPLE_RATE = 1000;
+const MAX_SAMPLE_RATE = 384000;
+/** Well above any real capture device, and low enough to bound allocations. */
+const MAX_CHANNELS = 32;
+
+const DEFAULT_SAMPLE_RATE = 16000;
+
+/**
+ * Reads the formats out of an INIT, reporting rather than papering over values
+ * that cannot be right.
+ *
+ * unpack.cc falls back to the capture rate for the reverse and output rates
+ * only; it uses the capture rate and every channel count verbatim. Silently
+ * substituting a plausible-looking value for a missing capture rate would
+ * misdecode the whole segment with no indication, so anything substituted here
+ * is warned about, and a channel count that would drive a huge allocation
+ * rejects the segment instead.
+ */
+function formatsFromInit(
+  init: webrtc.audioproc.IInit,
+  initIndex: number,
+  warnings: string[]
+): Record<TrackKind, SegmentFormat> | null {
+  const rawRate = init.sampleRate ?? 0;
+  let sampleRate = rawRate;
+  if (!(rawRate >= MIN_SAMPLE_RATE && rawRate <= MAX_SAMPLE_RATE)) {
+    warnings.push(
+      `Init #${initIndex} reports an implausible capture sample rate (${rawRate}); ` +
+        `assuming ${DEFAULT_SAMPLE_RATE}Hz, so its timing may be wrong.`
+    );
+    sampleRate = DEFAULT_SAMPLE_RATE;
+  }
+
+  const rate = (value: number | null | undefined, label: string): number => {
+    const candidate = value ?? 0;
+    if (candidate === 0) return sampleRate; // upstream's documented fallback
+    if (candidate >= MIN_SAMPLE_RATE && candidate <= MAX_SAMPLE_RATE) return candidate;
+    warnings.push(
+      `Init #${initIndex} reports an implausible ${label} sample rate (${candidate}); ` +
+        `using the capture rate instead.`
+    );
+    return sampleRate;
+  };
+
+  const channelCount = (value: number | null | undefined, label: string): number | null => {
+    const candidate = value ?? 0;
+    if (candidate === 0) return 1; // upstream treats an absent count as mono
+    if (candidate > 0 && candidate <= MAX_CHANNELS) return candidate;
+    warnings.push(
+      `Init #${initIndex} reports ${candidate} ${label} channels, which cannot be right; ` +
+        `skipping the segment rather than misdecoding it.`
+    );
+    return null;
+  };
+
+  const inputChannels = channelCount(init.numInputChannels, 'input');
+  const outputChannels = channelCount(init.numOutputChannels, 'output');
+  const reverseChannels = channelCount(init.numReverseChannels, 'reverse');
+  if (inputChannels === null || outputChannels === null || reverseChannels === null) {
+    return null;
+  }
+
   return {
-    // unpack.cc falls back to the capture rate when these are absent or zero.
-    reverse: {
-      sampleRate: init.reverseSampleRate || sampleRate,
-      channels: init.numReverseChannels || 1,
-    },
-    input: {
-      sampleRate,
-      channels: init.numInputChannels || 1,
-    },
-    ref_out: {
-      sampleRate: init.outputSampleRate || sampleRate,
-      channels: init.numOutputChannels || 1,
-    },
+    reverse: { sampleRate: rate(init.reverseSampleRate, 'reverse'), channels: reverseChannels },
+    input: { sampleRate, channels: inputChannels },
+    ref_out: { sampleRate: rate(init.outputSampleRate, 'output'), channels: outputChannels },
   };
 }
 
@@ -369,14 +425,10 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         if (!init) break;
         closeCurrent();
         initCount++;
+        const formats = formatsFromInit(init, initCount, warnings);
+        if (!formats) break;
         const timestampMs = optionalInt64(init, 'timestampMs');
-        current = new SegmentBuilder(
-          initCount,
-          captureFrameCount,
-          formatsFromInit(init),
-          timestampMs
-        );
-        const formats = current.formats;
+        current = new SegmentBuilder(initCount, captureFrameCount, formats, timestampMs);
         markers.push({
           kind: 'init',
           frame: captureFrameCount,
