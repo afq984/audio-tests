@@ -222,3 +222,47 @@ describe('block granularity is not drift', () => {
     expect(result.discontinuityWindowFrames).toBe(5);
   });
 });
+
+/** Healthy stream: capture blocks of cb frames against render blocks of rb, equal rates. */
+function mismatchedBlocks(cb: number, rb: number, seconds: number): CallOrderSegment {
+  const events: Array<[number, string]> = [];
+  for (let t = 0; t < seconds * 1000; t += cb * 10) events.push([t, 'c'.repeat(cb)]);
+  for (let t = 0; t < seconds * 1000; t += rb * 10) events.push([t + 0.5, 'r'.repeat(rb)]);
+  events.sort((a, b) => a[0] - b[0]);
+  return callOrder(events.map((e) => e[1]).join(''));
+}
+
+describe('mismatched block sizes', () => {
+  // The delivery cycle repeats once both streams return to the same phase,
+  // which takes a common multiple of the two block sizes -- not the capture
+  // block alone. A window aligned only to capture straddles the cycle.
+  it.each([
+    [1, 1],
+    [1, 4],
+    [4, 1],
+    [2, 3],
+    [4, 3],
+    [3, 5],
+    [2, 5],
+  ])('reports no discontinuities for healthy %i/%i block delivery', (cb, rb) => {
+    expect(analyzeCallOrder(mismatchedBlocks(cb, rb, 30)).discontinuities).toEqual([]);
+  });
+
+  it('spans whole delivery cycles', () => {
+    const result = analyzeCallOrder(mismatchedBlocks(4, 3, 30));
+    const { captureBlockFrames, renderBlockFrames } = result.blocks;
+    expect(result.discontinuityWindowFrames % captureBlockFrames).toBe(0);
+    expect(result.discontinuityWindowFrames % renderBlockFrames).toBe(0);
+  });
+
+  it('still catches a real gap under mismatched blocks', () => {
+    const healthy = mismatchedBlocks(4, 3, 15);
+    const text = String.fromCharCode(...healthy.calls);
+    const half = Math.floor(text.length / 2);
+    // Drop a full second of render calls in the middle.
+    const withGap = callOrder(text.slice(0, half) + 'c'.repeat(100) + text.slice(half));
+    const result = analyzeCallOrder(withGap);
+    expect(result.discontinuities.length).toBeGreaterThan(0);
+    expect(result.discontinuities.some((d) => d.stepMs < -100)).toBe(true);
+  });
+});

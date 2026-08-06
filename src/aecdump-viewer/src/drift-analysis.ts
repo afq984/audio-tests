@@ -120,15 +120,7 @@ export function analyzeCallOrder(
   }: DriftOptions = {}
 ): DriftAnalysis {
   const blocks = detectBlockStructure(segment.calls);
-  // The drift series is sampled once per capture call, so a capture block of N
-  // frames makes it sawtooth with period N: render sits up to N frames behind
-  // purely because of buffering, and catches up when the next render block
-  // lands. Spanning a whole number of those periods cancels the sawtooth
-  // exactly, leaving only real movement. A window that is not a multiple of
-  // the period straddles the wrap and reads every cycle as a step.
-  const window =
-    discontinuityWindowFrames ??
-    blocks.captureBlockFrames * Math.ceil(minimumWindowFrames / blocks.captureBlockFrames);
+  const window = discontinuityWindowFrames ?? derivedWindow(blocks, minimumWindowFrames);
 
   const points: DriftPoint[] = [];
 
@@ -179,6 +171,34 @@ export function analyzeCallOrder(
     driftMsPerMinute,
     leadingRenderFrames,
   };
+}
+
+/**
+ * Window that whole delivery cycles fit into.
+ *
+ * The drift series is sampled once per capture call, and buffering makes it
+ * sawtooth: render sits behind for the length of a capture block, then catches
+ * up when a render block lands. The pattern repeats once both streams return
+ * to the same phase, which takes a common multiple of the two block sizes --
+ * not the capture block alone. With 40ms capture against 30ms render the cycle
+ * is 12 capture frames, and a window of 8 straddles it and reads roughly every
+ * cycle as a step.
+ *
+ * Spanning a whole number of cycles cancels the sawtooth exactly, leaving only
+ * real movement.
+ */
+function derivedWindow(blocks: BlockStructure, minimumWindowFrames: number): number {
+  const cycle = leastCommonMultiple(blocks.captureBlockFrames, blocks.renderBlockFrames);
+  return cycle * Math.ceil(minimumWindowFrames / cycle);
+}
+
+function greatestCommonDivisor(a: number, b: number): number {
+  return b === 0 ? a : greatestCommonDivisor(b, a % b);
+}
+
+function leastCommonMultiple(a: number, b: number): number {
+  if (a <= 0 || b <= 0) return 1;
+  return (a * b) / greatestCommonDivisor(a, b);
 }
 
 /**
