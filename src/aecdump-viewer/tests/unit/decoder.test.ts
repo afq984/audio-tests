@@ -3,6 +3,7 @@ import { parseAecDump } from '../../src/decoder.js';
 import {
   makeInt16Dump,
   makeFloatDump,
+  makeSegmentedDump,
   countUnalignedInt16Payloads,
   samplesPerFrame,
 } from '../fixtures/make-dump.js';
@@ -149,5 +150,50 @@ describe('malformed input', () => {
     const result = parseAecDump(new ArrayBuffer(0));
     expect(result.input.channelData).toHaveLength(0);
     expect(result.reference.channelData).toHaveLength(0);
+  });
+});
+
+describe('re-initialisation', () => {
+  it('keeps audio across a re-INIT that does not change the format', () => {
+    // AudioProcessingImpl writes an INIT on every InitializeLocked, and
+    // ApplyConfig triggers that with an unchanged api_format -- so an ordinary
+    // config change mid-call must not truncate the audio.
+    const frames = 30;
+    const result = parseAecDump(
+      makeSegmentedDump([
+        { frames: 10, sampleRate: RATE, channels: 1 },
+        { frames: 10, sampleRate: RATE, channels: 1 },
+        { frames: 10, sampleRate: RATE, channels: 1 },
+      ])
+    );
+    expect(result.input.channelData[0].length).toBe(frames * PER_FRAME);
+    expect(result.output.channelData[0].length).toBe(frames * PER_FRAME);
+    expect(result.input.sampleRate).toBe(RATE);
+  });
+
+  it('places each same-format segment at its capture position', () => {
+    const result = parseAecDump(
+      makeSegmentedDump([
+        { frames: 10, sampleRate: RATE, channels: 1 },
+        { frames: 10, sampleRate: RATE, channels: 1 },
+      ])
+    );
+    // Segment two starts at frame 10, so its first sample lands there rather
+    // than being appended wherever segment one happened to end.
+    const input = result.input.channelData[0];
+    expect(input.length).toBe(20 * PER_FRAME);
+    expect(input.subarray(10 * PER_FRAME, 11 * PER_FRAME).some((s) => s !== 0)).toBe(true);
+  });
+
+  it('stops at a genuine format change', () => {
+    const result = parseAecDump(
+      makeSegmentedDump([
+        { frames: 10, sampleRate: 16000, channels: 1 },
+        { frames: 10, sampleRate: 48000, channels: 2 },
+      ])
+    );
+    // Only the 16kHz run is representable in the flat V1 shape.
+    expect(result.input.sampleRate).toBe(16000);
+    expect(result.input.channelData[0].length).toBe(10 * (16000 / 100));
   });
 });
