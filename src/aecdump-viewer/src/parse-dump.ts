@@ -1,8 +1,13 @@
 import { webrtc } from './proto/debug.js';
 import {
+  CALL_CAPTURE,
+  CALL_RENDER,
+  CallOrderSegment,
   DumpSegment,
   DumpTrack,
   FRAMES_PER_SECOND,
+  Marker,
+  MetadataSeries,
   ParsedDump,
   SegmentFormat,
   TrackKind,
@@ -10,6 +15,39 @@ import {
 } from './dump-model.js';
 
 const Event = webrtc.audioproc.Event;
+
+/**
+ * Collects one per-capture-frame value, growing as frames arrive and recording
+ * which frames actually carried the field. Stays null until the first value, so
+ * a dump that never reports a field yields null rather than an array of zeros.
+ */
+class SeriesCollector {
+  private values: number[] = [];
+  private present: number[] = [];
+  private seen = false;
+
+  record(frame: number, value: number) {
+    this.seen = true;
+    while (this.values.length < frame) {
+      this.values.push(0);
+      this.present.push(0);
+    }
+    this.values[frame] = value;
+    this.present[frame] = 1;
+  }
+
+  finish(frameCount: number): { values: Int32Array; present: Uint8Array } | null {
+    if (!this.seen) return null;
+    const values = new Int32Array(frameCount);
+    const present = new Uint8Array(frameCount);
+    const limit = Math.min(frameCount, this.values.length);
+    for (let i = 0; i < limit; i++) {
+      values[i] = this.values[i];
+      present[i] = this.present[i];
+    }
+    return { values, present };
+  }
+}
 
 /** Upstream's default filename prefixes (`unpack.cc` FLAGS_*_file). */
 const TRACK_PREFIX: Record<TrackKind, string> = {
@@ -116,6 +154,8 @@ class StreamAccumulator {
 /** A segment under construction. */
 class SegmentBuilder {
   readonly accumulators: Record<TrackKind, StreamAccumulator>;
+  /** Render/capture call order, one char code per event, in file order. */
+  readonly calls: number[] = [];
   frameCount = 0;
 
   constructor(
@@ -190,6 +230,58 @@ function optionalInt64(message: object, field: string): number | undefined {
   return typeof asLong.toNumber === 'function' ? asLong.toNumber() : Number(value);
 }
 
+/** Reads an optional proto2 scalar that may be absent, using own-property presence. */
+function optionalScalar(message: object, field: string): number | boolean | string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(message, field)) return undefined;
+  const value = (message as Record<string, unknown>)[field];
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'string') {
+    return value;
+  }
+  return undefined;
+}
+
+/** Field order mirrors unpack.cc's PRINT_CONFIG sequence in settings.txt. */
+const CONFIG_FIELDS = [
+  'aecEnabled',
+  'aecDelayAgnosticEnabled',
+  'aecDriftCompensationEnabled',
+  'aecExtendedFilterEnabled',
+  'aecSuppressionLevel',
+  'agcEnabled',
+  'agcMode',
+  'agcLimiterEnabled',
+  'noiseRobustAgcEnabled',
+  'hpfEnabled',
+  'nsEnabled',
+  'nsLevel',
+  'transientSuppressionEnabled',
+  'preAmplifierEnabled',
+  'preAmplifierFixedGainFactor',
+  'experimentsDescription',
+  // Upstream documents this as more likely to be current than the individual
+  // fields above; it arrived with the proto sync.
+  'apiConfigString',
+];
+
+const RUNTIME_SETTING_FIELDS = [
+  'capturePreGain',
+  'customRenderProcessingSetting',
+  'captureFixedPostGain',
+  'playoutVolumeChange',
+  'captureOutputUsed',
+  'capturePostGain',
+];
+
+function presentFields(message: object, fields: string[]): Array<[string, string]> {
+  const detail: Array<[string, string]> = [];
+  for (const field of fields) {
+    const value = optionalScalar(message, field);
+    if (value !== undefined) detail.push([field, String(value)]);
+  }
+  return detail;
+}
+
 function formatsFromInit(init: webrtc.audioproc.IInit): Record<TrackKind, SegmentFormat> {
   const sampleRate = init.sampleRate || 16000;
   return {
@@ -221,6 +313,13 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
   const warnings: string[] = [];
   const segments: DumpSegment[] = [];
 
+  const markers: Marker[] = [];
+  const callOrder: CallOrderSegment[] = [];
+  const delay = new SeriesCollector();
+  const drift = new SeriesCollector();
+  const appliedInputVolume = new SeriesCollector();
+  const keypress = new SeriesCollector();
+
   let offset = 0;
   let eventCount = 0;
   let captureFrameCount = 0;
@@ -231,6 +330,10 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
     if (!current) return;
     current.frameCount = captureFrameCount - current.startFrame;
     segments.push(current.finish());
+    callOrder.push({
+      startFrame: current.startFrame,
+      calls: Uint8Array.from(current.calls),
+    });
     current = null;
   };
 
@@ -266,18 +369,63 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         if (!init) break;
         closeCurrent();
         initCount++;
+        const timestampMs = optionalInt64(init, 'timestampMs');
         current = new SegmentBuilder(
           initCount,
           captureFrameCount,
           formatsFromInit(init),
-          optionalInt64(init, 'timestampMs')
+          timestampMs
         );
+        const formats = current.formats;
+        markers.push({
+          kind: 'init',
+          frame: captureFrameCount,
+          time: framesToSeconds(captureFrameCount),
+          label: `Init #${initCount}`,
+          detail: [
+            ['input', `${formats.input.sampleRate}Hz x${formats.input.channels}`],
+            ['output', `${formats.ref_out.sampleRate}Hz x${formats.ref_out.channels}`],
+            ['reverse', `${formats.reverse.sampleRate}Hz x${formats.reverse.channels}`],
+            ...(timestampMs === undefined
+              ? []
+              : ([['timestamp_ms', String(timestampMs)]] as Array<[string, string]>)),
+          ],
+        });
+        break;
+      }
+
+      case Event.Type.CONFIG: {
+        const config = event.config;
+        if (!config) break;
+        markers.push({
+          kind: 'config',
+          frame: captureFrameCount,
+          time: framesToSeconds(captureFrameCount),
+          // Upstream logs this as "APM re-config at frame: N".
+          label: 'APM re-config',
+          detail: presentFields(config, CONFIG_FIELDS),
+        });
+        break;
+      }
+
+      case Event.Type.RUNTIME_SETTING: {
+        const setting = event.runtimeSetting;
+        if (!setting) break;
+        const detail = presentFields(setting, RUNTIME_SETTING_FIELDS);
+        markers.push({
+          kind: 'runtime-setting',
+          frame: captureFrameCount,
+          time: framesToSeconds(captureFrameCount),
+          label: detail.length > 0 ? detail[0][0] : 'runtime setting',
+          detail,
+        });
         break;
       }
 
       case Event.Type.REVERSE_STREAM: {
         const rev = event.reverseStream;
         if (!rev || !current) break;
+        current.calls.push(CALL_RENDER);
         const acc = current.accumulators.reverse;
         if (rev.data && rev.data.length > 0) {
           acc.appendInterleavedInt16(rev.data);
@@ -293,6 +441,18 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         // arrives before the first INIT, so names stay aligned with upstream.
         const frameIndex = captureFrameCount++;
         if (!stream || !current) break;
+        current.calls.push(CALL_CAPTURE);
+
+        // The metadata series are indexed by capture frame, so they line up
+        // with the audio without any extra bookkeeping.
+        const delayValue = optionalScalar(stream, 'delay');
+        if (typeof delayValue === 'number') delay.record(frameIndex, delayValue);
+        const driftValue = optionalScalar(stream, 'drift');
+        if (typeof driftValue === 'number') drift.record(frameIndex, driftValue);
+        const volumeValue = optionalScalar(stream, 'appliedInputVolume');
+        if (typeof volumeValue === 'number') appliedInputVolume.record(frameIndex, volumeValue);
+        const keypressValue = optionalScalar(stream, 'keypress');
+        if (typeof keypressValue === 'boolean') keypress.record(frameIndex, keypressValue ? 1 : 0);
 
         // Pad up to this frame's position before appending, so an event that
         // carries only one stream does not shift the other out of lockstep.
@@ -317,8 +477,6 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
       }
 
       default:
-        // Config and RuntimeSetting are modelled separately; see the metadata
-        // series and markers.
         break;
     }
   }
@@ -329,5 +487,21 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
     warnings.push('The dump contains audio but no INIT event, so its format is unknown.');
   }
 
-  return { segments, captureFrameCount, eventCount, warnings };
+  const delayResult = delay.finish(captureFrameCount);
+  const driftResult = drift.finish(captureFrameCount);
+  const volumeResult = appliedInputVolume.finish(captureFrameCount);
+  const keypressResult = keypress.finish(captureFrameCount);
+
+  const series: MetadataSeries = {
+    delay: delayResult?.values ?? null,
+    delayPresent: delayResult?.present ?? null,
+    drift: driftResult?.values ?? null,
+    driftPresent: driftResult?.present ?? null,
+    appliedInputVolume: volumeResult?.values ?? null,
+    appliedInputVolumePresent: volumeResult?.present ?? null,
+    keypress: keypressResult ? Uint8Array.from(keypressResult.values) : null,
+    keypressPresent: keypressResult?.present ?? null,
+  };
+
+  return { segments, captureFrameCount, eventCount, series, markers, callOrder, warnings };
 }

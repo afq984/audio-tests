@@ -220,6 +220,73 @@ export function makeSegmentedDump(
   return concat(parts);
 }
 
+export interface MetadataDumpOptions {
+  frames?: number;
+  sampleRate?: number;
+  /** Per-frame field values; return undefined to leave the field absent. */
+  delayAt?: (frame: number) => number | undefined;
+  driftAt?: (frame: number) => number | undefined;
+  volumeAt?: (frame: number) => number | undefined;
+  keypressAt?: (frame: number) => boolean | undefined;
+  /** CONFIG events emitted just before the capture frame with that index. */
+  configAt?: Record<number, webrtc.audioproc.IConfig>;
+  /** RUNTIME_SETTING events emitted just before the capture frame with that index. */
+  runtimeSettingAt?: Record<number, webrtc.audioproc.IRuntimeSetting>;
+}
+
+/**
+ * Single-segment float dump with controllable per-frame metadata and injected
+ * CONFIG / RUNTIME_SETTING events. For exercising the metadata series, markers
+ * and call order rather than the audio.
+ */
+export function makeMetadataDump({
+  frames = 20,
+  sampleRate = 16000,
+  delayAt,
+  driftAt,
+  volumeAt,
+  keypressAt,
+  configAt = {},
+  runtimeSettingAt = {},
+}: MetadataDumpOptions = {}): ArrayBuffer {
+  const perFrame = samplesPerFrame(sampleRate);
+  const parts = [initMessage({ sampleRate, channels: 1 })];
+
+  for (let i = 0; i < frames; i++) {
+    if (configAt[i]) {
+      parts.push(frameMessage({ type: Event.Type.CONFIG, config: configAt[i] }));
+    }
+    if (runtimeSettingAt[i]) {
+      parts.push(
+        frameMessage({ type: Event.Type.RUNTIME_SETTING, runtimeSetting: runtimeSettingAt[i] })
+      );
+    }
+    parts.push(
+      frameMessage({
+        type: Event.Type.REVERSE_STREAM,
+        reverseStream: { channel: channelPayloads(perFrame, 1, i) },
+      })
+    );
+
+    const stream: webrtc.audioproc.IStream = {
+      inputChannel: channelPayloads(perFrame, 1, i + 100),
+      outputChannel: channelPayloads(perFrame, 1, i + 200),
+    };
+    const delay = delayAt ? delayAt(i) : 40;
+    if (delay !== undefined) stream.delay = delay;
+    const drift = driftAt?.(i);
+    if (drift !== undefined) stream.drift = drift;
+    const volume = volumeAt?.(i);
+    if (volume !== undefined) stream.appliedInputVolume = volume;
+    const keypress = keypressAt?.(i);
+    if (keypress !== undefined) stream.keypress = keypress;
+
+    parts.push(frameMessage({ type: Event.Type.STREAM, stream }));
+  }
+
+  return concat(parts);
+}
+
 /** One deinterleaved float payload per channel. */
 function channelPayloads(samples: number, channels: number, seed: number): Uint8Array[] {
   return Array.from({ length: channels }, (_, c) => floatPayload(samples, seed + c * 7));

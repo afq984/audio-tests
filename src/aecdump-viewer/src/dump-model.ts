@@ -60,12 +60,75 @@ export interface DumpSegment {
   tracks: DumpTrack[];
 }
 
+/**
+ * Per-capture-frame values from the Stream events, indexed by capture frame.
+ *
+ * These are what `unpack_aecdump --full` writes as headerless `delay.int32`,
+ * `drift.int32`, `level.int32` and `keypress.bool`. They are the reason to open
+ * an aecdump rather than a pair of WAVs, so they are always collected here
+ * rather than hidden behind a flag.
+ *
+ * A field is null when no event in the dump carried it. Frames where the field
+ * was absent hold the `*Present` bit as 0, so a gap is distinguishable from a
+ * genuine zero.
+ */
+export interface MetadataSeries {
+  /** Reported render-capture delay in ms, per capture frame. */
+  delay: Int32Array | null;
+  delayPresent: Uint8Array | null;
+  /** Reported clock drift, per capture frame. */
+  drift: Int32Array | null;
+  driftPresent: Uint8Array | null;
+  /** Applied input (microphone) volume, per capture frame. */
+  appliedInputVolume: Int32Array | null;
+  appliedInputVolumePresent: Uint8Array | null;
+  /** Keypress flag, per capture frame. */
+  keypress: Uint8Array | null;
+  keypressPresent: Uint8Array | null;
+}
+
+export type MarkerKind = 'init' | 'config' | 'runtime-setting';
+
+/**
+ * A point event on the capture timeline. Upstream records these in
+ * `settings.txt` ("APM re-config at frame: N") and as Audacity label tracks.
+ */
+export interface Marker {
+  kind: MarkerKind;
+  /** Capture frame the event was seen at. */
+  frame: number;
+  /** Seconds from the start of the capture timeline. */
+  time: number;
+  /** Short label, e.g. `Init #2` or `capture_pre_gain`. */
+  label: string;
+  /** Field/value pairs, in the order upstream prints them. */
+  detail: Array<[string, string]>;
+}
+
+/**
+ * The render/capture call order for one segment: one character per event in
+ * file order, `r` for REVERSE_STREAM and `c` for STREAM. This is exactly the
+ * byte stream `unpack_aecdump --full` writes to `callorder<suffix>.char`, and
+ * the input to render/capture drift analysis.
+ */
+export interface CallOrderSegment {
+  /** Capture frame the segment starts at; matches DumpSegment.startFrame. */
+  startFrame: number;
+  calls: Uint8Array;
+}
+
+export const CALL_RENDER = 'r'.charCodeAt(0);
+export const CALL_CAPTURE = 'c'.charCodeAt(0);
+
 export interface ParsedDump {
   segments: DumpSegment[];
   /** Total capture frames across the dump; the length of the capture timeline. */
   captureFrameCount: number;
   /** Total events read, including ones the parser does not model. */
   eventCount: number;
+  series: MetadataSeries;
+  markers: Marker[];
+  callOrder: CallOrderSegment[];
   /** Non-fatal problems worth surfacing rather than logging and forgetting. */
   warnings: string[];
 }
