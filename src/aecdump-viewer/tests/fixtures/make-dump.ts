@@ -165,6 +165,14 @@ export interface SegmentSpec extends InitFormat {
    * how two segments end up with the same unpack-style filename.
    */
   reverseOnlyFrames?: number;
+  /**
+   * Capture frame indices whose REVERSE_STREAM event carries no payload at all.
+   *
+   * No stock WebRTC build emits these -- every WriteRenderStreamMessage
+   * overload writes a payload unconditionally -- so this exists to pin what the
+   * parser does with a dump that did not come from one.
+   */
+  emptyReverse?: number[];
 }
 
 /**
@@ -203,12 +211,15 @@ export function makeSegmentedDump(
       const seed = frameCounter;
       if (spec.reverse !== false) {
         const perReverse = samplesPerFrame(reverseRate);
+        const empty = spec.emptyReverse?.includes(i) ?? false;
         parts.push(
           frameMessage({
             type: Event.Type.REVERSE_STREAM,
-            reverseStream: float
-              ? { channel: channelPayloads(perReverse, channels, seed) }
-              : { data: int16Payload(perReverse, channels, seed) },
+            reverseStream: empty
+              ? {}
+              : float
+                ? { channel: channelPayloads(perReverse, channels, seed) }
+                : { data: int16Payload(perReverse, channels, seed) },
           })
         );
       }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseDump } from '../../src/parse-dump.js';
-import { allTracks, dumpDuration, framesToSeconds } from '../../src/dump-model.js';
+import { CALL_RENDER, allTracks, dumpDuration, framesToSeconds } from '../../src/dump-model.js';
 import {
   makeCallOrderDump,
   makeSegmentedDump,
@@ -251,5 +251,81 @@ describe('native track origins', () => {
     const second = dump.segments[1];
     expect(second.startRenderFrame).toBe(second.startFrame);
     expect(second.tracks.find((t) => t.kind === 'reverse')!.startTime).toBeCloseTo(1.0, 9);
+  });
+});
+
+describe('reverse events with no payload', () => {
+  it('skips them, keeping call count and sample count in step', () => {
+    // No stock WebRTC build emits these, so the parser defines the semantics:
+    // an event carrying no audio is not a render frame.
+    const dump = parseDump(
+      makeSegmentedDump([{ frames: 10, sampleRate: RATE, emptyReverse: [3, 7] }])
+    );
+    const segment = dump.segments[0];
+    const reverse = segment.tracks.find((t) => t.kind === 'reverse')!;
+    const renderCalls = dump.callOrder[0].calls.filter((c) => c === CALL_RENDER).length;
+
+    expect(renderCalls).toBe(8);
+    expect(reverse.channelData[0].length).toBe(8 * PER_FRAME);
+    // The invariant the event-time runs depend on: one call, one block.
+    expect(reverse.channelData[0].length / PER_FRAME).toBe(renderCalls);
+  });
+
+  it('does not shift the audio that follows one', () => {
+    // Frame 3's payload is dropped, so what used to be frames 4..9 must still
+    // be frames 4..9 of the render stream -- not slid one frame earlier.
+    const clean = parseDump(makeSegmentedDump([{ frames: 10, sampleRate: RATE }]));
+    const holed = parseDump(
+      makeSegmentedDump([{ frames: 10, sampleRate: RATE, emptyReverse: [3] }])
+    );
+    const from = (dump: ReturnType<typeof parseDump>, frame: number) =>
+      Array.from(
+        dump.segments[0].tracks
+          .find((t) => t.kind === 'reverse')!
+          .channelData[0].subarray(frame * PER_FRAME, (frame + 1) * PER_FRAME)
+      );
+
+    // Frame 3 of the holed stream is the audio that was frame 4 of the clean
+    // one: the skipped event contributed nothing and nothing was invented for
+    // it. Every later frame follows in order, one position earlier.
+    expect(from(holed, 3)).toEqual(from(clean, 4));
+    expect(from(holed, 6)).toEqual(from(clean, 7));
+    expect(from(holed, 0)).toEqual(from(clean, 0));
+  });
+
+  it('warns rather than shrinking the stream silently', () => {
+    const dump = parseDump(
+      makeSegmentedDump([{ frames: 10, sampleRate: RATE, emptyReverse: [3, 7] }])
+    );
+    expect(dump.warnings).toHaveLength(1);
+    expect(dump.warnings[0]).toMatch(/2 reverse events carried no audio/);
+    expect(dump.warnings[0]).toMatch(/call order/);
+  });
+
+  it('uses the singular for a single event', () => {
+    const dump = parseDump(
+      makeSegmentedDump([{ frames: 5, sampleRate: RATE, emptyReverse: [1] }])
+    );
+    expect(dump.warnings[0]).toMatch(/1 reverse event carried no audio and was skipped/);
+  });
+
+  it('says nothing when every reverse event carries audio', () => {
+    const dump = parseDump(makeSegmentedDump([{ frames: 5, sampleRate: RATE }]));
+    expect(dump.warnings).toEqual([]);
+  });
+
+  it('keeps the render origin of a later segment consistent with the audio', () => {
+    // A skipped event must not advance the render clock either, or the next
+    // segment's reverse track would start one frame late.
+    const dump = parseDump(
+      makeSegmentedDump([
+        { frames: 10, sampleRate: RATE, emptyReverse: [2] },
+        { frames: 5, sampleRate: RATE },
+      ])
+    );
+    expect(dump.segments[1].startRenderFrame).toBe(9);
+    expect(dump.segments[0].tracks.find((t) => t.kind === 'reverse')!.channelData[0].length).toBe(
+      9 * PER_FRAME
+    );
   });
 });

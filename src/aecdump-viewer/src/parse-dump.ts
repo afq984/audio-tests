@@ -391,6 +391,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
   let captureFrameCount = 0;
   let renderFrameCount = 0;
   let initCount = 0;
+  let emptyReverseEvents = 0;
   let current: SegmentBuilder | null = null;
 
   const closeCurrent = () => {
@@ -494,17 +495,32 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
       case Event.Type.REVERSE_STREAM: {
         const rev = event.reverseStream;
         if (!rev) break;
+        const int16 = rev.data && rev.data.length > 0 ? rev.data : null;
+        const float = rev.channel && rev.channel.length > 0 ? rev.channel : null;
+        // A reverse event carries exactly one thing: audio. With none it is not
+        // a render frame, so it is skipped entirely rather than counted.
+        // Counting it would leave the render track one frame short of the calls
+        // that supposedly produced it, and every frame after would draw and
+        // play 10ms early. Padding instead would substitute silence for missing
+        // data, which is worse: a shift eventually looks wrong on screen, but
+        // fabricated silence looks like a finding.
+        //
+        // A capture event cannot use this rule. It also carries the metadata
+        // series and the timeline position that names the files, so skipping
+        // one would desync delay/drift and shift every later filename suffix.
+        // A missing capture payload stays a per-track condition.
+        if (!int16 && !float) {
+          emptyReverseEvents++;
+          break;
+        }
         // Counted even before the first INIT, so a render track's native origin
         // stays right for every later segment.
         renderFrameCount++;
         if (!current) break;
         current.calls.push(CALL_RENDER);
         const acc = current.accumulators.reverse;
-        if (rev.data && rev.data.length > 0) {
-          acc.appendInterleavedInt16(rev.data);
-        } else if (rev.channel && rev.channel.length > 0) {
-          acc.appendDeinterleavedFloat(rev.channel);
-        }
+        if (int16) acc.appendInterleavedInt16(int16);
+        else acc.appendDeinterleavedFloat(float!);
         break;
       }
 
@@ -555,6 +571,18 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
   }
 
   closeCurrent();
+
+  if (emptyReverseEvents > 0) {
+    // No WebRTC build produces these -- every WriteRenderStreamMessage overload
+    // writes a payload unconditionally -- so seeing one means the dump did not
+    // come from a stock APM. Say so rather than silently shrinking the render
+    // stream, which would otherwise be the only trace.
+    warnings.push(
+      `${emptyReverseEvents} reverse event${emptyReverseEvents === 1 ? '' : 's'} carried ` +
+        `no audio and ${emptyReverseEvents === 1 ? 'was' : 'were'} skipped. Upstream would ` +
+        `still count ${emptyReverseEvents === 1 ? 'it' : 'them'} in the call order.`
+    );
+  }
 
   if (segments.length === 0 && captureFrameCount > 0) {
     warnings.push('The dump contains audio but no INIT event, so its format is unknown.');
