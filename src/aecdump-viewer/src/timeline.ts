@@ -19,12 +19,57 @@
  * identity, with each track on its own clock and the user aligning it.
  */
 
-/** A time-varying correction, sampled at arbitrary points and interpolated. */
+/**
+ * A time-varying correction, sampled at arbitrary points and interpolated.
+ *
+ * Build one with makeDriftCurve, which enforces the invariants seeking depends
+ * on. Constructing the object directly skips those checks.
+ */
 export interface DriftCurve {
   /** Native times, strictly ascending. */
   times: Float64Array;
   /** Seconds to add at each corresponding time. */
   offsets: Float64Array;
+}
+
+/**
+ * Validates and builds a drift curve.
+ *
+ * Three invariants matter, and all three are about keeping the transform
+ * invertible, because seeking has to map a click back to a native time:
+ *
+ *   - equal lengths and finite values, or interpolation yields NaN
+ *   - strictly ascending times, or the search for a bracketing pair is
+ *     meaningless
+ *   - strictly ascending display knots (time + offset), or the transform is
+ *     not monotonic. A correction falling faster than real time makes display
+ *     time run backwards, and bisection then has several roots to choose
+ *     between and no basis to pick one. A plateau is just as bad: seeking
+ *     lands anywhere in it.
+ */
+export function makeDriftCurve(times: ArrayLike<number>, offsets: ArrayLike<number>): DriftCurve {
+  if (times.length !== offsets.length) {
+    throw new Error(`drift curve: ${times.length} times against ${offsets.length} offsets`);
+  }
+  for (let i = 0; i < times.length; i++) {
+    if (!Number.isFinite(times[i]) || !Number.isFinite(offsets[i])) {
+      throw new Error(`drift curve: non-finite value at index ${i}`);
+    }
+    if (i > 0) {
+      if (times[i] <= times[i - 1]) {
+        throw new Error(`drift curve: times must ascend strictly (index ${i})`);
+      }
+      const previousDisplay = times[i - 1] + offsets[i - 1];
+      const display = times[i] + offsets[i];
+      if (display <= previousDisplay) {
+        throw new Error(
+          `drift curve: correction at index ${i} reverses or halts display time, ` +
+            `which would make seeking ambiguous`
+        );
+      }
+    }
+  }
+  return { times: Float64Array.from(times), offsets: Float64Array.from(offsets) };
 }
 
 export interface TrackTransform {
@@ -81,11 +126,25 @@ export function toNativeTime(
 ): number {
   if (!transform.driftCurve) return displayTime - transform.offsetSeconds;
 
-  // Bracket the answer, widening until it contains the target.
+  // Bracket the answer, widening until it contains the target. Uses 2 ** i
+  // rather than 1 << i, which wraps to negative past 31 bits and would widen
+  // the bracket the wrong way.
   let low = displayTime - transform.offsetSeconds - 1;
   let high = displayTime - transform.offsetSeconds + 1;
-  for (let i = 0; i < 60 && toDisplayTime(transform, low) > displayTime; i++) low -= 1 << i;
-  for (let i = 0; i < 60 && toDisplayTime(transform, high) < displayTime; i++) high += 1 << i;
+  let bracketed = false;
+  for (let i = 0; i < 64; i++) {
+    if (toDisplayTime(transform, low) <= displayTime && toDisplayTime(transform, high) >= displayTime) {
+      bracketed = true;
+      break;
+    }
+    if (toDisplayTime(transform, low) > displayTime) low -= 2 ** i;
+    if (toDisplayTime(transform, high) < displayTime) high += 2 ** i;
+  }
+  // A validated curve is monotonic and bounded, so this cannot happen; if it
+  // somehow does, say so rather than returning a silently wrong position.
+  if (!bracketed) {
+    throw new Error(`timeline: could not bracket display time ${displayTime}`);
+  }
 
   for (let i = 0; i < iterations; i++) {
     const mid = (low + high) / 2;

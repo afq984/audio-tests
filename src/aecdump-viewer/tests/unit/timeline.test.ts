@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   IDENTITY_TRANSFORM,
   DriftCurve,
+  makeDriftCurve,
   makeTransform,
   toDisplayTime,
   toNativeTime,
@@ -79,5 +80,59 @@ describe('drift curve', () => {
     const transform = makeTransform(0, curve([5], [0.2]));
     expect(toDisplayTime(transform, 0)).toBeCloseTo(0.2, 12);
     expect(toDisplayTime(transform, 100)).toBeCloseTo(100.2, 12);
+  });
+});
+
+describe('curve validation', () => {
+  it('accepts a well-formed curve', () => {
+    expect(() => makeDriftCurve([0, 10, 20], [0, 0.1, 0.2])).not.toThrow();
+  });
+
+  it('rejects mismatched lengths, which would interpolate to NaN', () => {
+    expect(() => makeDriftCurve([0, 10], [0])).toThrow(/times against/);
+  });
+
+  it('rejects non-finite values', () => {
+    expect(() => makeDriftCurve([0, NaN], [0, 1])).toThrow(/non-finite/);
+    expect(() => makeDriftCurve([0, 10], [0, Infinity])).toThrow(/non-finite/);
+  });
+
+  it('rejects times that do not ascend strictly', () => {
+    expect(() => makeDriftCurve([0, 10, 10], [0, 0.1, 0.2])).toThrow(/ascend strictly/);
+    expect(() => makeDriftCurve([0, 20, 10], [0, 0.1, 0.2])).toThrow(/ascend strictly/);
+  });
+
+  it('rejects a correction that makes display time run backwards', () => {
+    // Native advances 10s while the correction subtracts 20s: display time
+    // moves backwards, so a display position maps to several native ones and
+    // seeking has no basis to choose.
+    expect(() => makeDriftCurve([0, 10], [0, -20])).toThrow(/reverses or halts/);
+  });
+
+  it('rejects a plateau, where seeking would be ambiguous', () => {
+    // Correction exactly cancels the passage of time: every native time in the
+    // span maps to one display time.
+    expect(() => makeDriftCurve([0, 10], [0, -10])).toThrow(/reverses or halts/);
+  });
+
+  it('allows a steep but still monotonic correction', () => {
+    expect(() => makeDriftCurve([0, 10], [0, -9.9])).not.toThrow();
+  });
+
+  it('round-trips a validated steep curve', () => {
+    const transform = makeTransform(0, makeDriftCurve([0, 10], [0, -9]));
+    for (const native of [0, 2.5, 9.9]) {
+      expect(toNativeTime(transform, toDisplayTime(transform, native))).toBeCloseTo(native, 6);
+    }
+  });
+
+  it('inverts far outside the sampled range without integer overflow', () => {
+    // The bracket widens by powers of two; past 31 bits a shift would wrap
+    // negative and search the wrong direction.
+    const transform = makeTransform(0, makeDriftCurve([0, 10], [0, 0.1]));
+    for (const native of [1e5, 1e9, 1e12]) {
+      const display = toDisplayTime(transform, native);
+      expect(toNativeTime(transform, display)).toBeCloseTo(native, 0);
+    }
   });
 });
