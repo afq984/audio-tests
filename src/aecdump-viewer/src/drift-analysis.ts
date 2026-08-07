@@ -40,44 +40,65 @@ export interface DriftDiscontinuity {
 }
 
 /**
- * How each stream is delivered to APM.
+ * How calls of each kind cluster in the file.
  *
- * APM always processes 10ms frames, but a caller holding larger buffers calls
- * it several times in a row -- a 40ms render buffer produces four render calls
- * back to back. That shows up in the call order as runs (`ccccrrrr`) and is
- * worth reporting on its own: "render arrives in 40ms blocks while capture is
- * 10ms" is a fact about the audio stack, not a fault.
+ * APM always processes 10ms frames, but consecutive calls of one kind appear
+ * as runs (`ccccrrrr`) -- and that pattern has to be measured before drift can
+ * be, because run granularity looks exactly like drift if you sample naively.
  *
- * It also has to be measured before drift can be, because block granularity
- * looks exactly like drift if you sample naively.
+ * This is deliberately NOT called a block or buffer size. A run of four
+ * capture calls does not prove a 40ms capture callback: they may simply have
+ * accumulated between render callbacks. Call order records the order events
+ * were serialized, so run length is a lower bound on clustering and nothing
+ * more. Treat it as an input to the windowing rule, not as a fact about the
+ * audio stack to show a user.
+ *
+ * A run length is null when that stream made no calls at all -- unknown rather
+ * than one frame.
  */
-export interface BlockStructure {
-  /** Capture calls per delivery block. 1 means one frame at a time. */
-  captureBlockFrames: number;
-  /** Render calls per delivery block. */
-  renderBlockFrames: number;
-  /** Block durations in ms, for display. */
-  captureBlockMs: number;
-  renderBlockMs: number;
+export interface RunStructure {
+  /** Most common length of a consecutive capture run, or null if none. */
+  captureRunFrames: number | null;
+  /** Most common length of a consecutive render run, or null if none. */
+  renderRunFrames: number | null;
 }
 
 export interface DriftAnalysis {
   startFrame: number;
-  blocks: BlockStructure;
+  runs: RunStructure;
   /** Capture frames the discontinuity window actually spanned. */
   discontinuityWindowFrames: number;
   /** One point per capture call, in order. */
   points: DriftPoint[];
   discontinuities: DriftDiscontinuity[];
-  /** Drift accumulated from the first capture call to the last, in ms. */
-  totalDriftMs: number;
   /**
-   * Slope of the drift curve in ms per minute. NaN when the segment is too
-   * short to be meaningful, rather than a number extrapolated from noise.
+   * Difference between the first and last sampled drift, in ms.
+   *
+   * Phase-sensitive: run clustering makes drift sawtooth, so where the first
+   * and last samples fall within a cycle shifts this by up to one cycle. Use
+   * driftMsPerMinute for the actual rate; this is the raw observation.
+   */
+  endpointDriftMs: number;
+  /**
+   * Rate of drift in ms per minute, from a least-squares fit over every
+   * sample rather than the endpoints.
+   *
+   * Regression is insensitive to run phase -- the sawtooth is zero-mean around
+   * the trend -- so healthy clustered delivery reports ~0 instead of the
+   * endpoint artefact. NaN when the segment is too short to be meaningful,
+   * rather than a number extrapolated from noise.
    */
   driftMsPerMinute: number;
   /** Render calls that arrived before the first capture call. */
   leadingRenderFrames: number;
+  /**
+   * Render calls after the last capture call.
+   *
+   * Drift is sampled at capture calls, so these are never represented in
+   * `points`: `crcrrrrr` and `crcr` produce identical series. A non-zero value
+   * here means there was render activity the analysis could not observe.
+   */
+  trailingRenderFrames: number;
 }
 
 export interface DriftOptions {
@@ -87,9 +108,9 @@ export interface DriftOptions {
    */
   discontinuityThresholdMs?: number;
   /**
-   * Capture frames the change is measured across. Defaults to a multiple of
-   * the detected capture block size, which is what keeps block granularity out
-   * of the result -- see analyzeCallOrder.
+   * Capture frames the change is measured across. Defaults to a whole number
+   * of delivery cycles, which is what keeps run granularity out of the result
+   * -- see derivedWindow.
    *
    * Measuring across a window rather than between adjacent frames is what
    * separates a step from a slope. A gap spread over several frames shifts
@@ -98,7 +119,7 @@ export interface DriftOptions {
    * window, so it does not trip the threshold.
    */
   discontinuityWindowFrames?: number;
-  /** Smallest window to use when deriving one from the block size. */
+  /** Smallest window to use when deriving one from the run structure. */
   minimumWindowFrames?: number;
   /** Below this span the slope is not reported. */
   minimumSpanSeconds?: number;
@@ -119,14 +140,15 @@ export function analyzeCallOrder(
     minimumSpanSeconds = 1,
   }: DriftOptions = {}
 ): DriftAnalysis {
-  const blocks = detectBlockStructure(segment.calls);
-  const window = discontinuityWindowFrames ?? derivedWindow(blocks, minimumWindowFrames);
+  const runs = detectRunStructure(segment.calls);
+  const window = discontinuityWindowFrames ?? derivedWindow(runs, minimumWindowFrames);
 
   const points: DriftPoint[] = [];
 
   let renderFrames = 0;
   let captureFrames = 0;
   let leadingRenderFrames = 0;
+  let renderFramesAtLastCapture = 0;
   let sawCapture = false;
 
   for (const call of segment.calls) {
@@ -138,6 +160,7 @@ export function analyzeCallOrder(
     if (call !== CALL_CAPTURE) continue;
 
     sawCapture = true;
+    renderFramesAtLastCapture = renderFrames;
     const captureFrame = segment.startFrame + captureFrames;
     captureFrames++;
 
@@ -156,20 +179,21 @@ export function analyzeCallOrder(
 
   const first = points[0];
   const last = points[points.length - 1];
-  const totalDriftMs = first && last ? last.driftMs - first.driftMs : 0;
+  const endpointDriftMs = first && last ? last.driftMs - first.driftMs : 0;
   const spanSeconds = first && last ? last.time - first.time : 0;
   const driftMsPerMinute =
-    spanSeconds >= minimumSpanSeconds ? (totalDriftMs / spanSeconds) * 60 : NaN;
+    spanSeconds >= minimumSpanSeconds ? regressionSlopeMsPerSecond(points) * 60 : NaN;
 
   return {
     startFrame: segment.startFrame,
-    blocks,
+    runs,
     discontinuityWindowFrames: window,
     points,
     discontinuities,
-    totalDriftMs,
+    endpointDriftMs,
     driftMsPerMinute,
     leadingRenderFrames,
+    trailingRenderFrames: renderFrames - renderFramesAtLastCapture,
   };
 }
 
@@ -187,9 +211,37 @@ export function analyzeCallOrder(
  * Spanning a whole number of cycles cancels the sawtooth exactly, leaving only
  * real movement.
  */
-function derivedWindow(blocks: BlockStructure, minimumWindowFrames: number): number {
-  const cycle = leastCommonMultiple(blocks.captureBlockFrames, blocks.renderBlockFrames);
+function derivedWindow(runs: RunStructure, minimumWindowFrames: number): number {
+  const cycle = leastCommonMultiple(runs.captureRunFrames ?? 1, runs.renderRunFrames ?? 1);
   return cycle * Math.ceil(minimumWindowFrames / cycle);
+}
+
+/**
+ * Least-squares slope of drift against time, in ms per second.
+ *
+ * Fitting every sample rather than differencing the endpoints is what keeps
+ * run clustering out of the answer: the sawtooth is zero-mean around the
+ * trend, so it cancels in the fit but not in a first-to-last difference.
+ */
+function regressionSlopeMsPerSecond(points: DriftPoint[]): number {
+  if (points.length < 2) return NaN;
+  let sumT = 0;
+  let sumD = 0;
+  for (const point of points) {
+    sumT += point.time;
+    sumD += point.driftMs;
+  }
+  const meanT = sumT / points.length;
+  const meanD = sumD / points.length;
+
+  let covariance = 0;
+  let variance = 0;
+  for (const point of points) {
+    const dt = point.time - meanT;
+    covariance += dt * (point.driftMs - meanD);
+    variance += dt * dt;
+  }
+  return variance === 0 ? NaN : covariance / variance;
 }
 
 function greatestCommonDivisor(a: number, b: number): number {
@@ -202,24 +254,20 @@ function leastCommonMultiple(a: number, b: number): number {
 }
 
 /**
- * Infers the delivery block size of each stream from runs in the call order.
+ * Infers how calls of each kind cluster, from runs in the call order.
  *
  * Uses the most common run length rather than the longest: a single odd run --
  * an extra render call where the clocks slipped, say -- should not redefine the
- * block size for the whole segment.
+ * pattern for the whole segment.
  */
-export function detectBlockStructure(calls: Uint8Array): BlockStructure {
-  const captureBlockFrames = modalRunLength(calls, CALL_CAPTURE);
-  const renderBlockFrames = modalRunLength(calls, CALL_RENDER);
+export function detectRunStructure(calls: Uint8Array): RunStructure {
   return {
-    captureBlockFrames,
-    renderBlockFrames,
-    captureBlockMs: captureBlockFrames * FRAME_MS,
-    renderBlockMs: renderBlockFrames * FRAME_MS,
+    captureRunFrames: modalRunLength(calls, CALL_CAPTURE),
+    renderRunFrames: modalRunLength(calls, CALL_RENDER),
   };
 }
 
-function modalRunLength(calls: Uint8Array, call: number): number {
+function modalRunLength(calls: Uint8Array, call: number): number | null {
   const tally = new Map<number, number>();
   let run = 0;
   for (let i = 0; i <= calls.length; i++) {
@@ -231,6 +279,7 @@ function modalRunLength(calls: Uint8Array, call: number): number {
     run = 0;
   }
 
+  if (tally.size === 0) return null;
   let best = 1;
   let bestCount = 0;
   for (const [length, count] of tally) {

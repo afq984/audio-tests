@@ -16,7 +16,7 @@ describe('lockstep', () => {
     const result = analyzeCallOrder(callOrder(repeat('rc', 200)));
     expect(result.points).toHaveLength(200);
     expect(result.points.every((p) => p.driftMs === 0)).toBe(true);
-    expect(result.totalDriftMs).toBe(0);
+    expect(result.endpointDriftMs).toBe(0);
     expect(result.discontinuities).toEqual([]);
     expect(result.driftMsPerMinute).toBe(0);
   });
@@ -25,7 +25,7 @@ describe('lockstep', () => {
     const result = analyzeCallOrder(callOrder(repeat('rc', 100)));
     // 100 frames is 0.99s between first and last sample.
     expect(result.driftMsPerMinute).toBeNaN();
-    expect(result.totalDriftMs).toBe(0);
+    expect(result.endpointDriftMs).toBe(0);
   });
 
   it('samples once per capture call and uses capture time as the x axis', () => {
@@ -43,13 +43,17 @@ describe('lockstep', () => {
 
 describe('clock drift', () => {
   it('reports a positive slope when render outpaces capture', () => {
-    // One extra render call per 10 captures. After group k the last capture
-    // sees render = 11k-1 against capture = 10k, so drift is (k-1) frames:
-    // 0 at the first sample and 59 frames (590ms) at the last, over 5.99s.
+    // One extra render call per 10 captures: 10ms gained per 100ms, so the
+    // truth is 6000ms per minute.
     const result = analyzeCallOrder(callOrder(repeat(repeat('rc', 10) + 'r', 60)));
     expect(result.points).toHaveLength(600);
-    expect(result.totalDriftMs).toBeCloseTo(590, 9);
-    expect(result.driftMsPerMinute).toBeCloseTo((590 / 5.99) * 60, 6);
+    expect(result.driftMsPerMinute).toBeCloseTo(6000, -2);
+
+    // The endpoint difference lands ~90ms/min short of that, because the first
+    // and last samples sit at different phases of the run cycle. That gap is
+    // exactly why the rate comes from a fit rather than the endpoints.
+    expect(result.endpointDriftMs).toBeCloseTo(590, 9);
+    expect((result.endpointDriftMs / 5.99) * 60).toBeCloseTo(5909.85, 1);
   });
 
   it('does not mistake a steady slope for a discontinuity', () => {
@@ -61,7 +65,7 @@ describe('clock drift', () => {
 
   it('reports a negative slope when capture outpaces render', () => {
     const result = analyzeCallOrder(callOrder(repeat(repeat('rc', 10) + 'c', 60)));
-    expect(result.totalDriftMs).toBeLessThan(0);
+    expect(result.endpointDriftMs).toBeLessThan(0);
     expect(result.driftMsPerMinute).toBeLessThan(0);
   });
 
@@ -85,7 +89,7 @@ describe('discontinuities', () => {
     // Reported where drift starts moving, which is the first capture frame of
     // the gap, not where the detection window happened to open.
     expect(result.discontinuities[0].captureFrame).toBe(50);
-    expect(result.totalDriftMs).toBeCloseTo(-50, 9);
+    expect(result.endpointDriftMs).toBeCloseTo(-50, 9);
   });
 
   it('flags a burst of render calls as an upward step', () => {
@@ -126,7 +130,7 @@ describe('edges', () => {
   it('handles a segment with no capture calls', () => {
     const result = analyzeCallOrder(callOrder('rrrr'));
     expect(result.points).toEqual([]);
-    expect(result.totalDriftMs).toBe(0);
+    expect(result.endpointDriftMs).toBe(0);
     expect(result.driftMsPerMinute).toBeNaN();
     expect(result.leadingRenderFrames).toBe(4);
   });
@@ -160,26 +164,21 @@ describe('analyzeDrift', () => {
 describe('delivery block structure', () => {
   it('detects 10ms capture against 40ms render', () => {
     const result = analyzeCallOrder(callOrder(repeat('ccccrrrr', 750)));
-    expect(result.blocks.captureBlockFrames).toBe(4);
-    expect(result.blocks.renderBlockFrames).toBe(4);
-    expect(result.blocks.renderBlockMs).toBe(40);
+    expect(result.runs.captureRunFrames).toBe(4);
+    expect(result.runs.renderRunFrames).toBe(4);
+    expect(result.runs.renderRunFrames).toBe(4);
   });
 
   it('reports one-frame blocks for a lockstep segment', () => {
     const result = analyzeCallOrder(callOrder(repeat('rc', 100)));
-    expect(result.blocks).toMatchObject({
-      captureBlockFrames: 1,
-      renderBlockFrames: 1,
-      captureBlockMs: 10,
-      renderBlockMs: 10,
-    });
+    expect(result.runs).toEqual({ captureRunFrames: 1, renderRunFrames: 1 });
   });
 
   it('ignores a single odd run when inferring the block size', () => {
     // One five-call render run among fours must not redefine the block size.
     let calls = '';
     for (let i = 0; i < 100; i++) calls += i === 50 ? 'ccccrrrrr' : 'ccccrrrr';
-    expect(analyzeCallOrder(callOrder(calls)).blocks.renderBlockFrames).toBe(4);
+    expect(analyzeCallOrder(callOrder(calls)).runs.renderRunFrames).toBe(4);
   });
 });
 
@@ -194,7 +193,7 @@ describe('block granularity is not drift', () => {
 
   it('derives a window that spans whole capture blocks', () => {
     const result = analyzeCallOrder(callOrder(repeat('ccccrrrr', 750)));
-    expect(result.discontinuityWindowFrames % result.blocks.captureBlockFrames).toBe(0);
+    expect(result.discontinuityWindowFrames % result.runs.captureRunFrames!).toBe(0);
     expect(result.discontinuityWindowFrames).toBeGreaterThanOrEqual(4);
   });
 
@@ -250,9 +249,9 @@ describe('mismatched block sizes', () => {
 
   it('spans whole delivery cycles', () => {
     const result = analyzeCallOrder(mismatchedBlocks(4, 3, 30));
-    const { captureBlockFrames, renderBlockFrames } = result.blocks;
-    expect(result.discontinuityWindowFrames % captureBlockFrames).toBe(0);
-    expect(result.discontinuityWindowFrames % renderBlockFrames).toBe(0);
+    const { captureRunFrames, renderRunFrames } = result.runs;
+    expect(result.discontinuityWindowFrames % captureRunFrames!).toBe(0);
+    expect(result.discontinuityWindowFrames % renderRunFrames!).toBe(0);
   });
 
   it('still catches a real gap under mismatched blocks', () => {
@@ -264,5 +263,48 @@ describe('mismatched block sizes', () => {
     const result = analyzeCallOrder(withGap);
     expect(result.discontinuities.length).toBeGreaterThan(0);
     expect(result.discontinuities.some((d) => d.stepMs < -100)).toBe(true);
+  });
+});
+
+describe('honest reporting', () => {
+  it('reports run structure as unknown for a stream that never called', () => {
+    expect(analyzeCallOrder(callOrder(repeat('c', 20))).runs).toEqual({
+      captureRunFrames: 20,
+      renderRunFrames: null,
+    });
+    expect(analyzeCallOrder(callOrder(repeat('r', 20))).runs).toEqual({
+      captureRunFrames: null,
+      renderRunFrames: 20,
+    });
+  });
+
+  it('counts render calls the drift series could not observe', () => {
+    // crcrrrrr and crcr produce identical drift points, because drift is only
+    // sampled at capture calls. The count is what distinguishes them.
+    const observed = analyzeCallOrder(callOrder('crc'));
+    const withTail = analyzeCallOrder(callOrder('crcrrrr'));
+    expect(withTail.points.map((p) => p.driftMs)).toEqual(observed.points.map((p) => p.driftMs));
+    expect(observed.trailingRenderFrames).toBe(0);
+    expect(withTail.trailingRenderFrames).toBe(4);
+  });
+
+  it('reports zero drift rate for healthy clustered delivery', () => {
+    // The endpoint difference is a phase artefact; the fitted rate is not.
+    const result = analyzeCallOrder(callOrder(repeat('ccccrrrr', 750)));
+    expect(result.endpointDriftMs).toBeCloseTo(-30, 9);
+    expect(Math.abs(result.driftMsPerMinute)).toBeLessThan(1);
+  });
+
+  it('reports zero drift rate for mismatched-run delivery too', () => {
+    const result = analyzeCallOrder(mismatchedBlocks(4, 3, 30));
+    expect(Math.abs(result.driftMsPerMinute)).toBeLessThan(1);
+  });
+
+  it('still measures a genuine drift rate', () => {
+    let calls = '';
+    for (let i = 0; i < 750; i++) calls += i % 25 === 0 ? 'ccccrrrrr' : 'ccccrrrr';
+    const result = analyzeCallOrder(callOrder(calls));
+    // One extra render frame per 25 blocks of 4 capture frames: 600ms/min.
+    expect(result.driftMsPerMinute).toBeCloseTo(600, -2);
   });
 });
