@@ -28,10 +28,10 @@ export type TrackKind = 'reverse' | 'input' | 'ref_out';
 /**
  * Which clock a track's samples are laid out against.
  *
- * `capture` tracks are positioned on the capture timeline directly. `render`
- * tracks are not: the reverse stream is driven by its own hardware clock, so
- * its samples are stored as they arrived and are projected onto capture
- * coordinates through the segment's renderToCaptureFrame map.
+ * Each timeline counts its own 10ms API calls, and they diverge whenever the
+ * two hardware clocks are not locked. Samples are stored exactly as they
+ * arrived on their own clock; putting the two on one axis is event-time.ts's
+ * job, and it is a declared visualization policy rather than recovered truth.
  */
 export type TrackTimeline = 'capture' | 'render';
 
@@ -94,25 +94,6 @@ export interface DumpSegment {
   formats: Record<TrackKind, SegmentFormat>;
   /** Only streams that carried data; a stream that never appeared is absent. */
   tracks: DumpTrack[];
-  /**
-   * Capture-coordinate projection for the render stream, indexed by the
-   * segment's render frame: `renderToCaptureFrame[k]` is the number of capture
-   * calls that had **completed before** render call k was written.
-   *
-   * This is an ordinal relationship recovered from the order events appear in
-   * the file, not clock synchronization. The two streams run on separate
-   * hardware clocks, so an interleaving like `crrccr` is ordinary jitter: for
-   * that sequence the map is [1, 1, 3] -- two render calls landing inside the
-   * same capture interval, then one after two more captures.
-   *
-   * Consequences for consumers:
-   *   - it is monotonic but not strictly so, so seeking by capture frame needs
-   *     a tie-break rule
-   *   - any smoothing or interpolation across it is a display policy, not
-   *     recovered truth; store it raw and smooth at the point of drawing
-   *   - null when the segment carried no render calls
-   */
-  renderToCaptureFrame: Int32Array | null;
 }
 
 /**

@@ -171,26 +171,27 @@ describe('framesToSeconds', () => {
   });
 });
 
-describe('capture-coordinate projection', () => {
-  it('maps an irregular interleaving without touching the audio', () => {
+describe('call order as ordinal evidence', () => {
+  it('records an irregular interleaving without touching the audio', () => {
     // The reverse stream runs on its own hardware clock, so an order like
     // crrccr is ordinary jitter rather than a fault.
     const dump = parseDump(makeCallOrderDump('crrccr'));
     const segment = dump.segments[0];
 
-    // Two render calls land inside one capture interval, then one arrives
-    // after two more captures.
-    expect(Array.from(segment.renderToCaptureFrame!)).toEqual([1, 1, 3]);
+    // The raw sequence is kept verbatim. Nothing derived from it is stored:
+    // a per-render-frame capture position would read as a coordinate, and
+    // call order records when events were serialized, not when a clock ticked.
+    expect(String.fromCharCode(...dump.callOrder[0].calls)).toBe('crrccr');
 
     // Three render calls means three frames of samples: no silence is injected
-    // to drag the render stream onto the capture clock.
+    // to drag the render stream onto the capture clock, and none is dropped
+    // where two render calls share a capture interval.
     const reverse = segment.tracks.find((t) => t.kind === 'reverse')!;
     expect(reverse.channelData[0].length).toBe(3 * PER_FRAME);
     expect(reverse.timeline).toBe('render');
 
-    // The map is metadata, not an applied warp: the track keeps its native
-    // start, because call order records serialization order rather than a
-    // clock measurement. Placing it is a display-time decision.
+    // The track keeps its native start. Placing it against capture is a
+    // display-time decision, made by the event-time layout.
     expect(reverse.startTime).toBe(0);
   });
 
@@ -202,15 +203,14 @@ describe('capture-coordinate projection', () => {
     expect(kinds).toEqual({ reverse: 'render', input: 'capture', ref_out: 'capture' });
   });
 
-  it('ties a render call to the capture that follows it, not the one before', () => {
-    // Leading render calls precede any capture, so they map to 0.
+  it('keeps leading render calls in the sequence', () => {
     const dump = parseDump(makeCallOrderDump('rrcc'));
-    expect(Array.from(dump.segments[0].renderToCaptureFrame!)).toEqual([0, 0]);
+    expect(String.fromCharCode(...dump.callOrder[0].calls)).toBe('rrcc');
   });
 
-  it('is null for a segment with no render calls', () => {
+  it('records an empty render side rather than omitting it', () => {
     const dump = parseDump(makeCallOrderDump('cccc'));
-    expect(dump.segments[0].renderToCaptureFrame).toBeNull();
+    expect(String.fromCharCode(...dump.callOrder[0].calls)).toBe('cccc');
   });
 
   it('counts capture frames from the segment start, not the dump start', () => {

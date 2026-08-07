@@ -159,11 +159,6 @@ class SegmentBuilder {
   readonly accumulators: Record<TrackKind, StreamAccumulator>;
   /** Render/capture call order, one char code per event, in file order. */
   readonly calls: number[] = [];
-  /**
-   * Capture calls completed before each render call in this segment; index is
-   * the render frame. See DumpSegment.renderToCaptureFrame.
-   */
-  readonly renderToCapture: number[] = [];
   frameCount = 0;
 
   constructor(
@@ -228,8 +223,6 @@ class SegmentBuilder {
       frameCount: this.frameCount,
       timestampMs: this.timestampMs,
       formats: this.formats,
-      renderToCaptureFrame:
-        this.renderToCapture.length > 0 ? Int32Array.from(this.renderToCapture) : null,
       tracks,
     };
   }
@@ -506,10 +499,6 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         renderFrameCount++;
         if (!current) break;
         current.calls.push(CALL_RENDER);
-        // Capture calls completed *before* this render call. Recording it
-        // before appending fixes the boundary convention: a render call that
-        // arrives between capture N-1 and N is tied to N, not to N-1.
-        current.renderToCapture.push(captureFrameCount - current.startFrame);
         const acc = current.accumulators.reverse;
         if (rev.data && rev.data.length > 0) {
           acc.appendInterleavedInt16(rev.data);
