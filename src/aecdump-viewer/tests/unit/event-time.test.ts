@@ -11,9 +11,16 @@ import {
 } from '../../src/event-time.js';
 
 /** One segment from a literal 'rcrc...' string. */
-const calls = (s: string, startFrame = 0): CallOrderSegment[] => [
-  { startFrame, calls: Uint8Array.from(s, (c) => c.charCodeAt(0)) },
+const calls = (s: string, startFrame = 0, startRenderFrame = 0): CallOrderSegment[] => [
+  { startFrame, startRenderFrame, calls: Uint8Array.from(s, (c) => c.charCodeAt(0)) },
 ];
+
+/** A segment literal, for tests that need more than one. */
+const seg = (s: string, startFrame: number, startRenderFrame: number): CallOrderSegment => ({
+  startFrame,
+  startRenderFrame,
+  calls: Uint8Array.from(s, (c) => c.charCodeAt(0)),
+});
 const repeat = (pattern: string, n: number) => pattern.repeat(n);
 
 /**
@@ -505,8 +512,8 @@ describe('continuity across INIT', () => {
     // neither clock. Laying each segment out from zero would silently realign
     // every reconfiguration.
     const split = layOutEventTime([
-      { startFrame: 0, calls: Uint8Array.from(repeat('rc', 50), (c) => c.charCodeAt(0)) },
-      { startFrame: 50, calls: Uint8Array.from(repeat('rc', 50), (c) => c.charCodeAt(0)) },
+      seg(repeat('rc', 50), 0, 0),
+      seg(repeat('rc', 50), 50, 50),
     ]);
     expect(split).toEqual(layOutEventTime(calls(repeat('rc', 100))));
     expect(split.captureRuns).toHaveLength(1);
@@ -517,10 +524,7 @@ describe('continuity across INIT', () => {
     // Render falls behind during segment one and only crosses the tolerance
     // after the INIT. The rebase must still happen.
     const layout = layOutEventTime(
-      [
-        { startFrame: 0, calls: Uint8Array.from('r' + repeat('c', 8), (c) => c.charCodeAt(0)) },
-        { startFrame: 8, calls: Uint8Array.from(repeat('c', 8) + 'r', (c) => c.charCodeAt(0)) },
-      ],
+      [seg('r' + repeat('c', 8), 0, 0), seg(repeat('c', 8) + 'r', 8, 1)],
       10
     );
     expect(layout.gaps).toEqual([
@@ -537,9 +541,9 @@ describe('continuity across INIT', () => {
 
   it('ignores segments that carried no calls', () => {
     const layout = layOutEventTime([
-      { startFrame: 0, calls: Uint8Array.from(repeat('rc', 10), (c) => c.charCodeAt(0)) },
-      { startFrame: 10, calls: new Uint8Array(0) },
-      { startFrame: 10, calls: Uint8Array.from(repeat('rc', 10), (c) => c.charCodeAt(0)) },
+      seg(repeat('rc', 10), 0, 0),
+      { startFrame: 10, startRenderFrame: 10, calls: new Uint8Array(0) },
+      seg(repeat('rc', 10), 10, 10),
     ]);
     expect(layout.captureRuns).toHaveLength(1);
     expect(layout.extentFrames).toBe(20);
@@ -550,17 +554,27 @@ describe('repeated rebases', () => {
   const layout = layOutEventTime(calls(repeat('ccccrrr', 200)), 4);
 
   it('reports the native frame that resumes after each gap', () => {
+    // Cross-checks two fields written at different moments: run.nativeStartFrame
+    // is taken when a block is placed, gap.nextNativeFrame when the lane
+    // rebases. Every rebase must start a run at exactly the frame it said would
+    // resume, so gap i pairs with run i+1. Reading both off the same reduce
+    // would only restate whatever the algorithm produced.
     expect(layout.gaps.length).toBeGreaterThan(10);
-    for (const gap of layout.gaps) {
-      expect(gap.stream).toBe('render');
-      // Everything placed before the gap is exactly what precedes the resume.
-      expect(gap.nextNativeFrame).toBe(framesBefore(layout, gap.eventStartFrame));
+    expect(layout.gaps.every((g) => g.stream === 'render')).toBe(true);
+    expect(layout.renderRuns).toHaveLength(layout.gaps.length + 1);
+    for (let i = 0; i < layout.gaps.length; i++) {
+      expect(layout.gaps[i].nextNativeFrame).toBe(layout.renderRuns[i + 1].nativeStartFrame);
+      expect(layout.renderRuns[i + 1].eventStartFrame).toBe(layout.gaps[i].eventEndFrame);
     }
   });
 
   it('keeps gaps ordered and non-overlapping within a lane', () => {
+    // A tolerance too tight for this pattern rebases BOTH lanes, so neither
+    // half of the check is vacuous.
+    const both = layOutEventTime(calls(repeat('ccccrrrr', 40)), 3);
     for (const stream of ['capture', 'render'] as const) {
-      const laneGaps = layout.gaps.filter((g) => g.stream === stream);
+      const laneGaps = both.gaps.filter((g) => g.stream === stream);
+      expect(laneGaps.length).toBeGreaterThan(5);
       for (let i = 1; i < laneGaps.length; i++) {
         expect(laneGaps[i].eventStartFrame).toBeGreaterThanOrEqual(laneGaps[i - 1].eventEndFrame);
       }
@@ -570,9 +584,12 @@ describe('repeated rebases', () => {
     }
   });
 
-  it('lays out a heavily rebasing dump in linear time', () => {
+  it('lays out a heavily rebasing dump without quadratic blowup', () => {
     // Every event rebases at zero tolerance, so this is the worst case for any
-    // per-rebase walk over the runs already built.
+    // per-rebase walk over the runs already built. A wall-clock bound is
+    // hardware-sensitive and not a complexity proof; it is a smoke test that
+    // catches a reintroduced O(runs) step, which at this size would take
+    // minutes rather than milliseconds.
     const heavy = calls(repeat('cr', 20_000));
     const started = performance.now();
     const result = layOutEventTime(heavy, 0);
@@ -581,9 +598,50 @@ describe('repeated rebases', () => {
   });
 });
 
-/** Render frames placed before an event slot, for the gap bookkeeping check. */
-function framesBefore(layout: EventTimeLayout, eventFrame: number): number {
-  return layout.renderRuns
-    .filter((r) => r.eventStartFrame < eventFrame)
-    .reduce((t, r) => t + r.frameCount, 0);
-}
+
+describe('native origins', () => {
+  it('numbers lanes from the first segment, not from zero', () => {
+    // Reverse events before the first valid INIT advance the global render
+    // counter but produce no samples. A lane numbered from zero would sit that
+    // many frames off DumpTrack.startFrame for the whole dump.
+    const layout = layOutEventTime([seg(repeat('rc', 10), 0, 3)]);
+    expect(layout.renderRuns[0]).toEqual({
+      nativeStartFrame: 3,
+      eventStartFrame: 0,
+      frameCount: 10,
+    });
+    expect(layout.captureRuns[0].nativeStartFrame).toBe(0);
+  });
+
+  it('maps a track origin to the first slot of its lane', () => {
+    const layout = layOutEventTime([seg(repeat('rc', 10), 0, 3)]);
+    // A reverse track built from this segment reports startFrame 3.
+    expect(toEventFrame(layout, 'render', 3)).toBe(0);
+    expect(toEventFrame(layout, 'render', 12)).toBe(9);
+    expect(toEventFrame(layout, 'render', 2)).toBeNull();
+  });
+
+  it('round-trips a seek against the offset origin', () => {
+    const layout = layOutEventTime([seg(repeat('rc', 10), 0, 3)]);
+    expect(toNativeFrame(layout, 'render', 0)).toEqual({ nativeFrame: 3, resolution: 'exact' });
+    expect(toNativeFrame(layout, 'render', 100)).toEqual({
+      nativeFrame: 13,
+      resolution: 'clamped-to-end',
+    });
+  });
+
+  it('refuses a non-finite seek even on an empty lane', () => {
+    const captureOnly = layOutEventTime(calls(repeat('c', 10)));
+    expect(runsFor(captureOnly, 'render')).toEqual([]);
+    expect(() => toNativeFrame(captureOnly, 'render', NaN)).toThrow(/cannot seek/);
+    expect(() => toNativeFrame(captureOnly, 'render', Infinity)).toThrow(/cannot seek/);
+    expect(toNativeFrame(captureOnly, 'render', 5)).toEqual({
+      nativeFrame: 0,
+      resolution: 'empty',
+    });
+  });
+
+  it('lays out nothing for no segments', () => {
+    expect(layOutEventTime([])).toMatchObject({ extentFrames: 0, gaps: [] });
+  });
+});

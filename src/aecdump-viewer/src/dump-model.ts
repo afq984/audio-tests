@@ -143,13 +143,31 @@ export interface Marker {
 
 /**
  * The render/capture call order for one segment: one character per event in
- * file order, `r` for REVERSE_STREAM and `c` for STREAM. This is exactly the
- * byte stream `unpack_aecdump --full` writes to `callorder<suffix>.char`, and
- * the input to render/capture drift analysis.
+ * file order, `r` for REVERSE_STREAM and `c` for STREAM. This is the byte
+ * stream `unpack_aecdump --full` writes to `callorder<suffix>.char`, and the
+ * input to render/capture drift analysis and to the event-time layout.
+ *
+ * One deliberate divergence from upstream: a reverse event whose payload is
+ * absent, empty or not a whole frame contributes no `r`, where upstream writes
+ * its call-order character outside the payload branches (`unpack.cc:387`) and
+ * so counts it. Keeping it would break the invariant every consumer here relies
+ * on -- one call, one block of samples -- so the sequence is a lossy compaction
+ * of the raw event order rather than a transcription of it. `parseDump` warns
+ * whenever it drops one, and no stock APM produces such an event. See
+ * parse-dump.ts.
  */
 export interface CallOrderSegment {
   /** Capture frame the segment starts at; matches DumpSegment.startFrame. */
   startFrame: number;
+  /**
+   * Render frame the segment starts at; matches DumpSegment.startRenderFrame.
+   *
+   * The event-time layout needs both origins to number its lanes on the same
+   * axis the tracks use. Events before the first valid INIT advance the global
+   * counters but produce no samples, so a layout numbering from zero would sit
+   * one frame off a track's `startFrame` for the whole dump.
+   */
+  startRenderFrame: number;
   calls: Uint8Array;
 }
 

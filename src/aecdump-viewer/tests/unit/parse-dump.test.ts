@@ -3,6 +3,7 @@ import { parseDump } from '../../src/parse-dump.js';
 import { CALL_RENDER, allTracks, dumpDuration, framesToSeconds } from '../../src/dump-model.js';
 import {
   makeCallOrderDump,
+  makeReversePayloadDump,
   makeSegmentedDump,
   makeFloatDump,
   makeInt16Dump,
@@ -271,9 +272,11 @@ describe('reverse events with no payload', () => {
     expect(reverse.channelData[0].length / PER_FRAME).toBe(renderCalls);
   });
 
-  it('does not shift the audio that follows one', () => {
-    // Frame 3's payload is dropped, so what used to be frames 4..9 must still
-    // be frames 4..9 of the render stream -- not slid one frame earlier.
+  it('compacts the stream, preserving sample order and block boundaries', () => {
+    // Not "nothing moves": the skipped event's frame is gone, so later audio
+    // sits one native position earlier. What must hold is that every remaining
+    // block keeps its order and stays on a frame boundary, so one call still
+    // means one block.
     const clean = parseDump(makeSegmentedDump([{ frames: 10, sampleRate: RATE }]));
     const holed = parseDump(
       makeSegmentedDump([{ frames: 10, sampleRate: RATE, emptyReverse: [3] }])
@@ -327,5 +330,81 @@ describe('reverse events with no payload', () => {
     expect(dump.segments[0].tracks.find((t) => t.kind === 'reverse')!.channelData[0].length).toBe(
       9 * PER_FRAME
     );
+  });
+});
+
+describe('reverse events that do not carry a whole frame', () => {
+  const withReversePayload = makeReversePayloadDump;
+
+  it('skips a present but empty float channel, which a length test would pass', () => {
+    // `channel: [<empty>]` has length 1, so an outer-length check counts it as
+    // a render frame while it decodes to no samples at all.
+    const dump = parseDump(withReversePayload({ channel: [new Uint8Array(0)] }));
+    expect(dump.callOrder[0].calls).toHaveLength(0);
+    expect(dump.segments[0].tracks.find((t) => t.kind === 'reverse')).toBeUndefined();
+    expect(dump.warnings.join(' ')).toMatch(/whole frame/);
+  });
+
+  it('skips an int16 payload too short to decode a sample', () => {
+    const dump = parseDump(withReversePayload({ data: new Uint8Array([0]) }));
+    expect(dump.callOrder[0].calls).toHaveLength(0);
+    expect(dump.warnings.join(' ')).toMatch(/whole frame/);
+  });
+
+  it('skips a payload that is a partial frame', () => {
+    // Half a frame would leave every later block off its sample boundary,
+    // which is worse than a missing frame: nothing after it lands on the grid.
+    const dump = parseDump(withReversePayload({ data: new Uint8Array(PER_FRAME) }));
+    expect(dump.callOrder[0].calls).toHaveLength(0);
+    expect(dump.warnings.join(' ')).toMatch(/whole frame/);
+  });
+
+  it('skips a payload longer than a frame', () => {
+    const dump = parseDump(withReversePayload({ data: new Uint8Array(PER_FRAME * 4) }));
+    expect(dump.callOrder[0].calls).toHaveLength(0);
+  });
+
+  it('accepts an exactly sized payload', () => {
+    const dump = parseDump(withReversePayload({ data: new Uint8Array(PER_FRAME * 2) }));
+    expect(dump.callOrder[0].calls).toHaveLength(1);
+    expect(dump.warnings).toEqual([]);
+    expect(
+      dump.segments[0].tracks.find((t) => t.kind === 'reverse')!.channelData[0].length
+    ).toBe(PER_FRAME);
+  });
+
+  it('distinguishes a missing payload from a malformed one', () => {
+    const missing = parseDump(withReversePayload({}));
+    expect(missing.warnings.join(' ')).toMatch(/carried no audio/);
+    expect(missing.warnings.join(' ')).not.toMatch(/whole frame/);
+  });
+});
+
+describe('call order origins', () => {
+  it('carries both native origins, so the layout can number its lanes', () => {
+    const dump = parseDump(
+      makeSegmentedDump([
+        { frames: 10, sampleRate: RATE, reverseOnlyFrames: 5 },
+        { frames: 6, sampleRate: RATE },
+      ])
+    );
+    expect(dump.callOrder.map((c) => c.startFrame)).toEqual([0, 10]);
+    expect(dump.callOrder.map((c) => c.startRenderFrame)).toEqual([0, 15]);
+    // The origins match the segments they came from, which is what makes a
+    // track's startFrame and a layout run's nativeStartFrame the same axis.
+    expect(dump.callOrder.map((c) => c.startRenderFrame)).toEqual(
+      dump.segments.map((s) => s.startRenderFrame)
+    );
+  });
+
+  it('excludes skipped reverse events from the render origin', () => {
+    const dump = parseDump(
+      makeSegmentedDump([
+        { frames: 10, sampleRate: RATE, emptyReverse: [2, 5] },
+        { frames: 6, sampleRate: RATE },
+      ])
+    );
+    expect(dump.callOrder[1].startRenderFrame).toBe(8);
+    expect(dump.segments[1].startRenderFrame).toBe(8);
   });
 });

@@ -3,8 +3,8 @@ import { analyzeCallOrder, analyzeDrift } from '../../src/drift-analysis.js';
 import { CallOrderSegment } from '../../src/dump-model.js';
 
 /** Builds a call-order segment from a literal 'rcrc...' string. */
-function callOrder(calls: string, startFrame = 0): CallOrderSegment {
-  return { startFrame, calls: Uint8Array.from(calls, (c) => c.charCodeAt(0)) };
+function callOrder(calls: string, startFrame = 0, startRenderFrame = 0): CallOrderSegment {
+  return { startFrame, startRenderFrame, calls: Uint8Array.from(calls, (c) => c.charCodeAt(0)) };
 }
 
 /** Repeats a pattern n times. */

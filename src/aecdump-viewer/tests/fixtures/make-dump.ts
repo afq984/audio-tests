@@ -423,3 +423,22 @@ export function countUnalignedInt16Payloads(dump: ArrayBuffer): number {
   }
   return unaligned;
 }
+
+/**
+ * An INIT followed by one REVERSE_STREAM carrying exactly `payload`.
+ *
+ * For pinning what the parser does with a reverse event that is present but
+ * does not carry a whole frame -- empty, undersized, oversized, or a float
+ * channel list whose entries decode to nothing. No stock WebRTC build emits
+ * one; the AecDumpImpl overloads do not validate their arguments, so only APM's
+ * own call sites guarantee a real payload.
+ */
+export function makeReversePayloadDump(
+  payload: webrtc.audioproc.IReverseStream,
+  { sampleRate = 16000, channels = 1 }: InitFormat = {}
+): ArrayBuffer {
+  return concat([
+    initMessage({ sampleRate, channels }),
+    frameMessage({ type: Event.Type.REVERSE_STREAM, reverseStream: payload }),
+  ]);
+}

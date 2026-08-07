@@ -392,6 +392,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
   let renderFrameCount = 0;
   let initCount = 0;
   let emptyReverseEvents = 0;
+  let malformedReverseEvents = 0;
   let current: SegmentBuilder | null = null;
 
   const closeCurrent = () => {
@@ -400,6 +401,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
     segments.push(current.finish());
     callOrder.push({
       startFrame: current.startFrame,
+      startRenderFrame: current.startRenderFrame,
       calls: Uint8Array.from(current.calls),
     });
     current = null;
@@ -495,21 +497,54 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
       case Event.Type.REVERSE_STREAM: {
         const rev = event.reverseStream;
         if (!rev) break;
-        const int16 = rev.data && rev.data.length > 0 ? rev.data : null;
-        const float = rev.channel && rev.channel.length > 0 ? rev.channel : null;
-        // A reverse event carries exactly one thing: audio. With none it is not
-        // a render frame, so it is skipped entirely rather than counted.
-        // Counting it would leave the render track one frame short of the calls
-        // that supposedly produced it, and every frame after would draw and
-        // play 10ms early. Padding instead would substitute silence for missing
-        // data, which is worse: a shift eventually looks wrong on screen, but
-        // fabricated silence looks like a finding.
+        // A reverse event carries exactly one thing: one frame of audio. An
+        // event that does not carry a whole frame is not a render frame, so it
+        // is skipped entirely rather than counted.
+        //
+        // Counting it would break the invariant every consumer relies on --
+        // frame k of a track occupies samples [k*perFrame, (k+1)*perFrame) --
+        // and the damage differs by case. An empty payload leaves the track one
+        // frame short of the calls that supposedly produced it, so everything
+        // after draws and plays 10ms early. A short payload is worse: it shifts
+        // every later sample offset within the frame grid, so no frame after it
+        // lands on a block boundary at all. Padding to size instead would
+        // substitute silence for missing data, and fabricated silence looks
+        // like a finding where a shift merely looks wrong.
+        //
+        // Checking the decoded sample count rather than the outer field length
+        // matters: `channel: [<empty>]` and `data: <1 byte>` both pass a length
+        // test and decode to nothing.
         //
         // A capture event cannot use this rule. It also carries the metadata
         // series and the timeline position that names the files, so skipping
         // one would desync delay/drift and shift every later filename suffix.
-        // A missing capture payload stays a per-track condition.
-        if (!int16 && !float) {
+        // It does not need the rule either: it pads to its computed offset
+        // before appending, so a bad payload cannot move the frames after it.
+        const perFrame = current ? current.accumulators.reverse.samplesPerFrame : 0;
+        const revChannels = current ? current.accumulators.reverse.channels : 0;
+        const int16 =
+          rev.data && current && (rev.data.byteLength >> 1) === perFrame * revChannels
+            ? rev.data
+            : null;
+        const float =
+          rev.channel &&
+          current &&
+          rev.channel.length >= revChannels &&
+          rev.channel.every((c) => c.byteLength / 4 === perFrame)
+            ? rev.channel
+            : null;
+        const carriedSomething =
+          (rev.data && rev.data.length > 0) || (rev.channel && rev.channel.length > 0);
+        if (current && !int16 && !float) {
+          if (carriedSomething) malformedReverseEvents++;
+          else emptyReverseEvents++;
+          break;
+        }
+        if (!current && !carriedSomething) {
+          // Before the first valid INIT there is no format to check against, so
+          // only the unambiguous case can be judged. Skipping it keeps the
+          // global render origin equal to the number of frames actually
+          // modelled, which is what the layout numbers its lanes by.
           emptyReverseEvents++;
           break;
         }
@@ -520,7 +555,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         current.calls.push(CALL_RENDER);
         const acc = current.accumulators.reverse;
         if (int16) acc.appendInterleavedInt16(int16);
-        else acc.appendDeinterleavedFloat(float!);
+        else if (float) acc.appendDeinterleavedFloat(float);
         break;
       }
 
@@ -572,15 +607,25 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
 
   closeCurrent();
 
+  // APM's own path cannot produce either of these: it passes formats already
+  // validated to have positive channel counts and supported rates, so every
+  // WriteRenderStreamMessage call writes a whole frame. A dump containing one
+  // did not come from that path, so say so rather than silently shrinking the
+  // render stream, which would otherwise be the only trace.
   if (emptyReverseEvents > 0) {
-    // No WebRTC build produces these -- every WriteRenderStreamMessage overload
-    // writes a payload unconditionally -- so seeing one means the dump did not
-    // come from a stock APM. Say so rather than silently shrinking the render
-    // stream, which would otherwise be the only trace.
     warnings.push(
       `${emptyReverseEvents} reverse event${emptyReverseEvents === 1 ? '' : 's'} carried ` +
         `no audio and ${emptyReverseEvents === 1 ? 'was' : 'were'} skipped. Upstream would ` +
         `still count ${emptyReverseEvents === 1 ? 'it' : 'them'} in the call order.`
+    );
+  }
+  if (malformedReverseEvents > 0) {
+    warnings.push(
+      `${malformedReverseEvents} reverse event${malformedReverseEvents === 1 ? '' : 's'} ` +
+        `did not carry a whole frame for the declared format and ` +
+        `${malformedReverseEvents === 1 ? 'was' : 'were'} skipped. Keeping ` +
+        `${malformedReverseEvents === 1 ? 'it' : 'them'} would put every later frame off ` +
+        `its sample boundary.`
     );
   }
 

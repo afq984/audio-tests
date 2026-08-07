@@ -157,6 +157,17 @@ export function layOutEventTime(
   const gaps: EventTimeGap[] = [];
   let frontier = 0;
 
+  // Number the lanes on the axis the tracks use. Events before the first valid
+  // INIT advance the global counters but produce no samples, so a lane starting
+  // at zero would sit that many frames off DumpTrack.startFrame for the whole
+  // dump -- and a render track would map to the wrong slot, silently, forever.
+  // Event slots still start at zero: the skipped events left no record of how
+  // they interleaved, so there is nothing to lay out for them.
+  if (segments.length > 0) {
+    capture.native = segments[0].startFrame;
+    render.native = segments[0].startRenderFrame;
+  }
+
   for (const segment of segments) {
     for (const call of segment.calls) {
       let lane: LaneBuilder;
@@ -258,11 +269,13 @@ export function toNativeFrame(
   stream: EventStream,
   eventFrame: number
 ): SeekResult {
-  const runs = runsFor(layout, stream);
-  if (runs.length === 0) return { nativeFrame: 0, resolution: 'empty' };
+  // Validated before the empty-lane shortcut, or an empty lane would quietly
+  // accept NaN and report a position for it.
   if (!Number.isFinite(eventFrame)) {
     throw new Error(`event time: cannot seek to ${eventFrame}`);
   }
+  const runs = runsFor(layout, stream);
+  if (runs.length === 0) return { nativeFrame: 0, resolution: 'empty' };
 
   const run = findRun(runs, eventFrame, (r) => r.eventStartFrame);
   if (run) {
