@@ -308,3 +308,42 @@ describe('honest reporting', () => {
     expect(result.driftMsPerMinute).toBeCloseTo(600, -2);
   });
 });
+
+describe('drift rate around discontinuities', () => {
+  it('is not tilted by a step in the middle of a drift-free segment', () => {
+    // 30s lockstep, a 500ms render gap, 30s lockstep. Both halves are in
+    // lockstep, so the true rate is zero; a single global fit reads -744.
+    const result = analyzeCallOrder(
+      callOrder(repeat('rc', 3000) + repeat('c', 50) + repeat('rc', 3000))
+    );
+    expect(result.discontinuities).toHaveLength(1);
+    expect(Math.abs(result.driftMsPerMinute)).toBeLessThan(0.5);
+    // The step itself is still reported; it just does not become a rate. Its
+    // extent covers the transition, not only the instant it began.
+    expect(result.endpointDriftMs).toBeCloseTo(-500, 9);
+    expect(result.discontinuities[0].endFrame).toBeGreaterThan(
+      result.discontinuities[0].captureFrame
+    );
+  });
+
+  it('is not tilted by a step near the start', () => {
+    const result = analyzeCallOrder(
+      callOrder(repeat('rc', 300) + repeat('c', 50) + repeat('rc', 5700))
+    );
+    expect(Math.abs(result.driftMsPerMinute)).toBeLessThan(0.5);
+  });
+
+  it('still measures drift that continues across a step', () => {
+    // Genuine 6000ms/min drift throughout, interrupted by one gap.
+    const drifting = repeat(repeat('rc', 10) + 'r', 300);
+    const result = analyzeCallOrder(callOrder(drifting + repeat('c', 50) + drifting));
+    expect(result.driftMsPerMinute).toBeCloseTo(6000, -2);
+  });
+
+  it('reports nothing when steps leave no span long enough to fit', () => {
+    // A gap every half second: no clean span reaches the one-second floor.
+    let calls = '';
+    for (let i = 0; i < 40; i++) calls += repeat('rc', 50) + repeat('c', 30);
+    expect(analyzeCallOrder(callOrder(calls)).driftMsPerMinute).toBeNaN();
+  });
+});

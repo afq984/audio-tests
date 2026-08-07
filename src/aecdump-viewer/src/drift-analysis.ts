@@ -33,9 +33,20 @@ export interface DriftPoint {
 }
 
 export interface DriftDiscontinuity {
+  /** Capture frame where drift starts moving. */
   captureFrame: number;
   time: number;
-  /** Change in drift at this point, in milliseconds. Negative is a render gap. */
+  /**
+   * Capture frame where drift stops moving.
+   *
+   * A step is not instantaneous: a 500ms render gap moves drift one frame at a
+   * time across 50 capture frames. Knowing the extent, not just the onset, is
+   * what lets the rate fit exclude the whole transition rather than a fixed
+   * window's worth of it.
+   */
+  endFrame: number;
+  endTime: number;
+  /** Change in drift across the transition, in ms. Negative is a render gap. */
   stepMs: number;
 }
 
@@ -182,7 +193,9 @@ export function analyzeCallOrder(
   const endpointDriftMs = first && last ? last.driftMs - first.driftMs : 0;
   const spanSeconds = first && last ? last.time - first.time : 0;
   const driftMsPerMinute =
-    spanSeconds >= minimumSpanSeconds ? regressionSlopeMsPerSecond(points) * 60 : NaN;
+    spanSeconds >= minimumSpanSeconds
+      ? fitRateMsPerMinute(points, discontinuities, window, minimumSpanSeconds)
+      : NaN;
 
   return {
     startFrame: segment.startFrame,
@@ -217,12 +230,73 @@ function derivedWindow(runs: RunStructure, minimumWindowFrames: number): number 
 }
 
 /**
- * Least-squares slope of drift against time, in ms per second.
+ * Drift rate in ms per minute, fitted within spans rather than across them.
  *
- * Fitting every sample rather than differencing the endpoints is what keeps
- * run clustering out of the answer: the sawtooth is zero-mean around the
- * trend, so it cancels in the fit but not in a first-to-last difference.
+ * A least-squares fit over the whole segment handles run clustering well --
+ * the sawtooth is zero-mean around the trend, so it cancels -- but not a step.
+ * A discontinuity shifts every later sample by a constant, which tilts a
+ * single global line: a 500ms gap in the middle of an otherwise drift-free
+ * segment fits at -744ms/min when the true rate is zero.
+ *
+ * The steps are already known, so cut the series at them, fit each clean span,
+ * and combine those slopes weighted by duration. Each span is an unbiased
+ * local estimate and a step between spans no longer enters any fit. Spans too
+ * short to be meaningful are skipped rather than allowed to dominate.
  */
+function fitRateMsPerMinute(
+  points: DriftPoint[],
+  discontinuities: DriftDiscontinuity[],
+  windowFrames: number,
+  minimumSpanSeconds: number
+): number {
+  const spans = cleanSpans(points, discontinuities, windowFrames);
+
+  let weighted = 0;
+  let totalWeight = 0;
+  for (const span of spans) {
+    const seconds = span[span.length - 1].time - span[0].time;
+    if (seconds < minimumSpanSeconds) continue;
+    const slope = regressionSlopeMsPerSecond(span);
+    if (!Number.isFinite(slope)) continue;
+    weighted += slope * seconds;
+    totalWeight += seconds;
+  }
+  // Every span was too short to fit -- typically one long segment cut up by
+  // frequent steps. Say nothing rather than report a number from fragments.
+  if (totalWeight === 0) return NaN;
+  return (weighted / totalWeight) * 60;
+}
+
+/**
+ * Splits the series at discontinuities, dropping the transition itself.
+ *
+ * A step takes up to `windowFrames` to complete, so the samples spanning it
+ * belong to neither side and are excluded from both.
+ */
+function cleanSpans(
+  points: DriftPoint[],
+  discontinuities: readonly DriftDiscontinuity[],
+  windowFrames: number
+): DriftPoint[][] {
+  if (discontinuities.length === 0) return points.length > 0 ? [points] : [];
+
+  const spans: DriftPoint[][] = [];
+  let start = 0;
+  for (const discontinuity of discontinuities) {
+    const onset = points.findIndex((p) => p.captureFrame >= discontinuity.captureFrame);
+    const end = points.findIndex((p) => p.captureFrame > discontinuity.endFrame);
+    if (onset < 0) continue;
+    if (onset > start) spans.push(points.slice(start, onset));
+    // Skip the whole transition, which the discontinuity's extent describes,
+    // plus the trailing window whose measurements still straddle it.
+    const resume = end < 0 ? points.length : end + windowFrames;
+    start = Math.max(start, resume);
+  }
+  if (start < points.length) spans.push(points.slice(start));
+  return spans.filter((span) => span.length >= 2);
+}
+
+/** Least-squares slope of drift against time, in ms per second. */
 function regressionSlopeMsPerSecond(points: DriftPoint[]): number {
   if (points.length < 2) return NaN;
   let sumT = 0;
@@ -312,12 +386,20 @@ function findDiscontinuities(
     const stepMs = points[i].driftMs - start.driftMs;
 
     if (Math.abs(stepMs) < thresholdMs) {
+      if (open) {
+        // The window no longer spans a large change, so the transition
+        // finished at or before this window's start.
+        open.endFrame = start.captureFrame;
+        open.endTime = start.time;
+      }
       open = null;
       continue;
     }
     if (open && Math.sign(stepMs) === Math.sign(open.stepMs)) {
       // Same event still unfolding; keep the largest shift it reaches.
       if (Math.abs(stepMs) > Math.abs(open.stepMs)) open.stepMs = stepMs;
+      open.endFrame = points[i].captureFrame;
+      open.endTime = points[i].time;
       continue;
     }
 
@@ -331,8 +413,23 @@ function findDiscontinuities(
         break;
       }
     }
-    open = { captureFrame: onset.captureFrame, time: onset.time, stepMs };
+    open = {
+      captureFrame: onset.captureFrame,
+      time: onset.time,
+      // Provisional: extended as the transition unfolds, closed when the
+      // window stops seeing a large change.
+      endFrame: points[i].captureFrame,
+      endTime: points[i].time,
+      stepMs,
+    };
     discontinuities.push(open);
+  }
+
+  // A transition still open at the end of the series ends with the series.
+  if (open && points.length > 0) {
+    const last = points[points.length - 1];
+    open.endFrame = last.captureFrame;
+    open.endTime = last.time;
   }
 
   return discontinuities;
