@@ -340,10 +340,35 @@ describe('drift rate around discontinuities', () => {
     expect(result.driftMsPerMinute).toBeCloseTo(6000, -2);
   });
 
-  it('reports nothing when steps leave no span long enough to fit', () => {
-    // A gap every half second: no clean span reaches the one-second floor.
+  it('treats a regularly repeating gap as a rate, not as steps', () => {
+    // 30 capture-only frames every 80: render falls behind 300ms every 800ms,
+    // which is a sustained -22500ms/min, not 40 separate discontinuities.
     let calls = '';
     for (let i = 0; i < 40; i++) calls += repeat('rc', 50) + repeat('c', 30);
-    expect(analyzeCallOrder(callOrder(calls)).driftMsPerMinute).toBeNaN();
+    const result = analyzeCallOrder(callOrder(calls));
+    expect(result.driftMsPerMinute).toBeCloseTo(-22500, -2);
+    expect(result.discontinuities).toEqual([]);
+  });
+});
+
+describe('irregular run lengths', () => {
+  // Run length is only a proxy for the delivery cycle, and these patterns have
+  // capture runs of both 3 and 1, so any modal estimate misses the true
+  // four-frame cycle. The window is chosen by measuring the series instead.
+  it.each(['cccrcrrr', 'crcccrrr', 'cccrrrcr', 'crrrcccr'])(
+    'reports no discontinuities for healthy %s delivery',
+    (pattern) => {
+      const result = analyzeCallOrder(callOrder(repeat(pattern, 750)));
+      expect(result.discontinuities).toEqual([]);
+      expect(Math.abs(result.driftMsPerMinute)).toBeLessThan(1);
+    }
+  );
+
+  it('is not fooled by a steep steady slope', () => {
+    // No render at all: drift falls 10ms every frame. That is one slope, not
+    // 200 steps, however steep.
+    const result = analyzeCallOrder(callOrder(repeat('c', 200)));
+    expect(result.discontinuities).toEqual([]);
+    expect(result.driftMsPerMinute).toBeCloseTo(-60000, -3);
   });
 });

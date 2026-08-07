@@ -130,8 +130,10 @@ export interface DriftOptions {
    * window, so it does not trip the threshold.
    */
   discontinuityWindowFrames?: number;
-  /** Smallest window to use when deriving one from the run structure. */
+  /** Smallest window to consider when deriving one. */
   minimumWindowFrames?: number;
+  /** Largest window to consider when deriving one. */
+  maximumWindowFrames?: number;
   /** Below this span the slope is not reported. */
   minimumSpanSeconds?: number;
 }
@@ -148,12 +150,11 @@ export function analyzeCallOrder(
     discontinuityThresholdMs = 2 * FRAME_MS,
     discontinuityWindowFrames,
     minimumWindowFrames = 5,
+    maximumWindowFrames = 200,
     minimumSpanSeconds = 1,
   }: DriftOptions = {}
 ): DriftAnalysis {
   const runs = detectRunStructure(segment.calls);
-  const window = discontinuityWindowFrames ?? derivedWindow(runs, minimumWindowFrames);
-
   const points: DriftPoint[] = [];
 
   let renderFrames = 0;
@@ -186,6 +187,8 @@ export function analyzeCallOrder(
     });
   }
 
+  const window =
+    discontinuityWindowFrames ?? derivedWindow(points, minimumWindowFrames, maximumWindowFrames);
   const discontinuities = findDiscontinuities(points, discontinuityThresholdMs, window);
 
   const first = points[0];
@@ -224,9 +227,88 @@ export function analyzeCallOrder(
  * Spanning a whole number of cycles cancels the sawtooth exactly, leaving only
  * real movement.
  */
-function derivedWindow(runs: RunStructure, minimumWindowFrames: number): number {
-  const cycle = leastCommonMultiple(runs.captureRunFrames ?? 1, runs.renderRunFrames ?? 1);
-  return cycle * Math.ceil(minimumWindowFrames / cycle);
+function derivedWindow(
+  points: DriftPoint[],
+  minimumWindowFrames: number,
+  maximumWindowFrames: number
+): number {
+  // Period detection needs only enough repetitions to be unambiguous.
+  const sampleCount = Math.min(points.length, 2000);
+  if (sampleCount <= minimumWindowFrames + 1) return minimumWindowFrames;
+
+  // Cap the search well short of the series length. A window long enough to
+  // span an isolated step sees the same change everywhere and so scores as
+  // perfectly flat, which would make that step look like the prevailing trend
+  // and hide it. A delivery cycle is short by nature, so a tenth of the series
+  // is ample room to find one.
+  const limit = Math.max(
+    minimumWindowFrames,
+    Math.min(maximumWindowFrames, Math.floor(sampleCount / 10))
+  );
+
+  let bestWindow = minimumWindowFrames;
+  let bestSpread = Infinity;
+  for (let window = minimumWindowFrames; window <= limit; window++) {
+    const spread = robustSpread(windowedChanges(points, window, sampleCount));
+    // Strictly better, so ties keep the smallest window: a shorter one
+    // localises a real step more precisely.
+    if (spread < bestSpread - 1e-9) {
+      bestSpread = spread;
+      bestWindow = window;
+    }
+  }
+  return bestWindow;
+}
+
+function windowedChanges(points: DriftPoint[], windowFrames: number, upTo: number): number[] {
+  const changes: number[] = [];
+  for (let i = windowFrames; i < upTo; i++) {
+    changes.push(points[i].driftMs - points[i - windowFrames].driftMs);
+  }
+  return changes;
+}
+
+function medianOf(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/** Fraction of the largest deviations discounted when scoring a window. */
+const OUTLIER_FRACTION = 0.1;
+
+/**
+ * How much the windowed change varies, discounting the largest few deviations.
+ *
+ * Two failure modes have to be avoided at once, which fixes the quantile
+ * between them:
+ *
+ * Plain variance is dominated by the very thing it is trying to see past. One
+ * real gap lifts the variance at every window, and a window that happens to
+ * straddle the gap can then score better than the one that cancels the
+ * delivery cycle -- which reintroduces a false step per cycle and buries the
+ * real gap among them.
+ *
+ * The median absolute deviation over-corrects. A four-frame cycle leaves three
+ * of every four deviations identical, so the median reads zero for a window
+ * that does not cancel the cycle at all, and the sawtooth survives.
+ *
+ * Discounting the top tenth is comfortably above an isolated gap's share of
+ * the series and comfortably below a cycle phase's.
+ */
+function robustSpread(values: number[]): number {
+  if (values.length === 0) return 0;
+  const centre = medianOf(values);
+  const deviations = values.map((value) => Math.abs(value - centre)).sort((a, b) => a - b);
+  const index = Math.floor((deviations.length - 1) * (1 - OUTLIER_FRACTION));
+  return deviations[index];
+}
+
+/** Median of drift[i] - drift[i-w] across the series; the prevailing trend. */
+function medianWindowedChange(points: DriftPoint[], windowFrames: number): number {
+  if (points.length <= windowFrames) return 0;
+  return medianOf(windowedChanges(points, windowFrames, points.length));
 }
 
 /**
@@ -318,14 +400,7 @@ function regressionSlopeMsPerSecond(points: DriftPoint[]): number {
   return variance === 0 ? NaN : covariance / variance;
 }
 
-function greatestCommonDivisor(a: number, b: number): number {
-  return b === 0 ? a : greatestCommonDivisor(b, a % b);
-}
 
-function leastCommonMultiple(a: number, b: number): number {
-  if (a <= 0 || b <= 0) return 1;
-  return (a * b) / greatestCommonDivisor(a, b);
-}
 
 /**
  * Infers how calls of each kind cluster, from runs in the call order.
@@ -381,9 +456,18 @@ function findDiscontinuities(
   const discontinuities: DriftDiscontinuity[] = [];
   let open: DriftDiscontinuity | null = null;
 
+  // A step is a departure from the prevailing trend, not a raw change. Steady
+  // drift moves the window by the same amount every time, however steep: a
+  // segment carrying no render calls at all shifts a five-frame window by 50ms
+  // throughout, which is one slope rather than thousands of steps. Measuring
+  // against the median windowed change subtracts whatever the trend happens to
+  // be, and the median is unmoved by the minority of windows spanning a real
+  // step.
+  const baselineMs = medianWindowedChange(points, windowFrames);
+
   for (let i = windowFrames; i < points.length; i++) {
     const start = points[i - windowFrames];
-    const stepMs = points[i].driftMs - start.driftMs;
+    const stepMs = points[i].driftMs - start.driftMs - baselineMs;
 
     if (Math.abs(stepMs) < thresholdMs) {
       if (open) {
