@@ -21,8 +21,27 @@ interface UiTrack {
   /** Safe for an element id and a CSS selector; `id` contains a colon. */
   domId: string;
   source: DumpTrack;
+  /** Largest absolute sample across every channel, in [0, 1]. */
+  peak: number;
   ws: WaveSurfer | null;
   url: string | null;
+}
+
+/** Peak as dBFS, or a dash for digital silence. */
+function formatDbfs(peak: number): string {
+  if (peak <= 0) return '-inf dBFS';
+  return `${(20 * Math.log10(peak)).toFixed(1)} dBFS`;
+}
+
+function peakOf(track: DumpTrack): number {
+  let peak = 0;
+  for (const channel of track.channelData) {
+    for (let i = 0; i < channel.length; i++) {
+      const magnitude = Math.abs(channel[i]);
+      if (magnitude > peak) peak = magnitude;
+    }
+  }
+  return peak;
 }
 
 @customElement('aecdump-viewer')
@@ -302,6 +321,7 @@ export class AecDumpViewer extends LitElement {
               ${track.source.channels > 1 ? html`&times;${track.source.channels}` : ''}
               &middot; ${track.source.duration.toFixed(2)}s
               &middot; ${track.source.timeline}
+              &middot; peak ${formatDbfs(track.peak)}
             </span>
             <button
               class="secondary listen ${audible ? 'active' : ''}"
@@ -406,6 +426,7 @@ export class AecDumpViewer extends LitElement {
           // a CSS selector.
           domId: source.id.replace(/[^a-zA-Z0-9_-]/g, '-'),
           source,
+          peak: peakOf(source),
           ws: null,
           url,
         },
@@ -432,7 +453,12 @@ export class AecDumpViewer extends LitElement {
       cursorColor: '#3c4043',
       cursorWidth: 2,
       dragToSeek: true,
-      normalize: true,
+      // Not normalized. Each track would otherwise be scaled to its own peak,
+      // so a capture stream 25dB below the playout reference draws exactly as
+      // tall as it does -- and a user who presses play and hears almost
+      // nothing has no way to tell a quiet dump from a broken decode. Levels
+      // across tracks are one of the things this view is for.
+      normalize: false,
     };
 
     for (const track of this.tracks) {
@@ -449,14 +475,15 @@ export class AecDumpViewer extends LitElement {
       ws.on('ready', (duration) => {
         this.duration = Math.max(this.duration, duration);
       });
-      if (track.id === this.audibleTrackId) {
-        ws.on('timeupdate', (time) => {
-          this.currentTime = time;
-        });
-        ws.on('finish', () => {
-          this.isPlaying = false;
-        });
-      }
+      // Bound for every track, not just the audible one: output moves between
+      // tracks and a handler attached only at load would leave the clock frozen
+      // and the Play button stuck after a switch.
+      ws.on('timeupdate', (time) => {
+        if (track.id === this.audibleTrackId) this.currentTime = time;
+      });
+      ws.on('finish', () => {
+        if (track.id === this.audibleTrackId) this.isPlaying = false;
+      });
 
       // Synchronized Seeking
       // Use the time carried by the event rather than ws.getCurrentTime():
