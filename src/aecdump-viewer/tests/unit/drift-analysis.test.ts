@@ -57,8 +57,10 @@ describe('clustered delivery', () => {
   });
 
   it('tracks a genuine rate mismatch as an accumulating deficit', () => {
-    // 40ms capture against 30ms render: render really does deliver a quarter
-    // less audio, so drift walks steadily negative instead of oscillating.
+    // Not a callback-size mismatch -- 40ms capture against 30ms render still
+    // yields equal call counts over their common cycle. Four capture calls
+    // against three render calls forever is a persistent 25% render deficit,
+    // so drift walks steadily negative instead of oscillating.
     const result = analyzeCallOrder(callOrder(repeat('ccccrrr', 100)));
     expect(result.captureFrameCount).toBe(400);
     expect(result.renderFrameCount).toBe(300);

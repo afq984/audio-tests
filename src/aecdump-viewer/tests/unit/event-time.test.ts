@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { CallOrderSegment } from '../../src/dump-model.js';
 import {
   DEFAULT_ALLOWED_LATENESS_FRAMES,
   EventTimeLayout,
@@ -9,8 +10,29 @@ import {
   toNativeFrame,
 } from '../../src/event-time.js';
 
-const calls = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
+/** One segment from a literal 'rcrc...' string. */
+const calls = (s: string, startFrame = 0): CallOrderSegment[] => [
+  { startFrame, calls: Uint8Array.from(s, (c) => c.charCodeAt(0)) },
+];
 const repeat = (pattern: string, n: number) => pattern.repeat(n);
+
+/**
+ * Interleaves two callback streams by delivery time, each callback handing APM
+ * one 10ms call per 10ms of its buffer. Render is written near the start of
+ * reverse processing and capture after capture processing finishes, so render
+ * takes a tie.
+ */
+function scheduled(captureMs: number, renderMs: number, durationMs: number): string {
+  const events: Array<[number, number, string]> = [];
+  for (let t = renderMs; t <= durationMs; t += renderMs) {
+    events.push([t, 0, 'r'.repeat(renderMs / 10)]);
+  }
+  for (let t = captureMs; t <= durationMs; t += captureMs) {
+    events.push([t, 1, 'c'.repeat(captureMs / 10)]);
+  }
+  events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  return events.map(([, , s]) => s).join('');
+}
 
 /** Slot occupied by each native frame of a lane, in order. */
 function slots(layout: EventTimeLayout, stream: 'capture' | 'render'): number[] {
@@ -107,9 +129,31 @@ describe('jitter', () => {
 });
 
 describe('unequal recurring clustering', () => {
+  it('absorbs healthy 40ms capture against 30ms render', () => {
+    // The real case. Different callback sizes do not mean different amounts of
+    // audio: over their common cycle a 40ms capture callback and a 30ms render
+    // callback hand APM the same number of 10ms calls, just in different
+    // batches. Nothing is missing, so nothing should gap.
+    const sequence = scheduled(40, 30, 24_000);
+    const layout = layOutEventTime(calls(sequence), DEFAULT_ALLOWED_LATENESS_FRAMES);
+    expect(frameCount(layout.captureRuns)).toBe(frameCount(layout.renderRuns));
+    expect(layout.gaps).toEqual([]);
+    expect(layout.captureRuns).toHaveLength(1);
+    expect(layout.renderRuns).toHaveLength(1);
+  });
+
+  it('absorbs a wider callback mismatch than the ratio alone suggests', () => {
+    // 100ms against 30ms: the batches differ by 7 frames but the long-run
+    // counts still match, so the tolerance absorbs it.
+    const layout = layOutEventTime(calls(scheduled(100, 30, 30_000)));
+    expect(frameCount(layout.captureRuns)).toBe(frameCount(layout.renderRuns));
+    expect(layout.gaps).toEqual([]);
+  });
+
   it('gaps the lane that genuinely delivers less audio', () => {
-    // 40ms capture against 30ms render: render is a quarter short, so it falls
-    // steadily behind and rebases, and the gaps are the audio it never sent.
+    // Not a callback mismatch: 4 capture calls against 3 render calls forever
+    // is a persistent 25% render deficit, so render really is short and the
+    // gaps are the audio it never sent.
     const layout = layOutEventTime(calls(repeat('ccccrrr', 100)), 10);
     expect(frameCount(layout.captureRuns)).toBe(400);
     expect(frameCount(layout.renderRuns)).toBe(300);
@@ -172,10 +216,30 @@ describe('one-sided interruption', () => {
     expect(layout.renderRuns).toHaveLength(2);
   });
 
+  it('leaves an internal gap where capture stopped and resumed', () => {
+    const layout = layOutEventTime(calls(repeat('cr', 50) + repeat('r', 200) + repeat('cr', 50)));
+    expect(layout.gaps).toHaveLength(1);
+    expect(layout.gaps[0]).toMatchObject({
+      stream: 'capture',
+      eventStartFrame: 50,
+      eventEndFrame: 250,
+      nextNativeFrame: 50,
+    });
+    expect(frameCount(layout.captureRuns)).toBe(100);
+    expect(layout.captureRuns).toHaveLength(2);
+  });
+
   it('extends the workspace for a render tail after capture ends', () => {
     const layout = layOutEventTime(calls(repeat('rc', 50) + repeat('r', 100)));
     expect(layout.extentFrames).toBe(150);
     expect(frameCount(layout.renderRuns)).toBe(150);
+    expect(layout.gaps).toEqual([]);
+  });
+
+  it('extends the workspace for a capture tail after render ends', () => {
+    const layout = layOutEventTime(calls(repeat('cr', 50) + repeat('c', 100)));
+    expect(layout.extentFrames).toBe(150);
+    expect(frameCount(layout.captureRuns)).toBe(150);
     expect(layout.gaps).toEqual([]);
   });
 });
@@ -331,7 +395,8 @@ describe('cursor mapping', () => {
   });
 
   it('returns null for a frame the layout never placed', () => {
-    expect(toEventFrame(layout, 'render', 100)).toBeNull();
+    // 100 is the exclusive end and does map -- see the finished-cursor case.
+    expect(toEventFrame(layout, 'render', 101)).toBeNull();
     expect(toEventFrame(layout, 'render', -1)).toBeNull();
   });
 
@@ -350,9 +415,11 @@ describe('cursor mapping', () => {
     });
   });
 
-  it('clamps past the final run', () => {
+  it('clamps past the final run to the end of the audio', () => {
+    // The end position, not the start of the final block: clicking past the
+    // tail should land where playback finishes, one frame later than frame 99.
     expect(toNativeFrame(layout, 'render', 100_000)).toEqual({
-      nativeFrame: 99,
+      nativeFrame: 100,
       resolution: 'clamped-to-end',
     });
   });
@@ -388,10 +455,135 @@ describe('cursor mapping', () => {
     }
   });
 
-  it('floors a fractional event position onto its slot', () => {
+  it('keeps the fractional part inside a run, to the sample', () => {
+    // Slope one, so the fraction passes through. Flooring here would seek up to
+    // 9ms early for a click part-way through a drawn block.
     expect(toNativeFrame(layout, 'capture', 30.9)).toEqual({
-      nativeFrame: 30,
+      nativeFrame: 30.9,
+      resolution: 'exact',
+    });
+    expect(toNativeFrame(layout, 'render', 250.5)).toEqual({
+      nativeFrame: 50.5,
       resolution: 'exact',
     });
   });
+
+  it('drops the fraction when snapping, because a snap lands on a boundary', () => {
+    expect(toNativeFrame(layout, 'render', 120.7)).toEqual({
+      nativeFrame: 50,
+      resolution: 'snapped-forward',
+    });
+  });
+
+  it('round-trips fractional positions', () => {
+    for (const event of [0.25, 30.9, 49.999, 250.5, 299.75]) {
+      const { nativeFrame, resolution } = toNativeFrame(layout, 'render', event);
+      if (resolution !== 'exact') continue;
+      expect(toEventFrame(layout, 'render', nativeFrame)).toBeCloseTo(event, 9);
+    }
+  });
+
+  it('places the position a finished cursor reaches, at the exact end', () => {
+    // The half-open runs contain no position at the very end, but that is where
+    // a playing cursor stops, and it must still draw somewhere.
+    expect(toEventFrame(layout, 'render', 100)).toBe(300);
+    expect(toEventFrame(layout, 'capture', 300)).toBe(300);
+    expect(toEventFrame(layout, 'render', 100.0001)).toBeNull();
+  });
+
+  it('refuses a non-finite position rather than returning NaN as exact', () => {
+    expect(toEventFrame(layout, 'render', NaN)).toBeNull();
+    expect(toEventFrame(layout, 'render', Infinity)).toBeNull();
+    expect(() => toNativeFrame(layout, 'render', NaN)).toThrow(/cannot seek/);
+    expect(() => toNativeFrame(layout, 'render', -Infinity)).toThrow(/cannot seek/);
+  });
 });
+
+describe('continuity across INIT', () => {
+  it('does not reset event time at a segment boundary', () => {
+    // An INIT cuts the streams into separately formatted tracks but resets
+    // neither clock. Laying each segment out from zero would silently realign
+    // every reconfiguration.
+    const split = layOutEventTime([
+      { startFrame: 0, calls: Uint8Array.from(repeat('rc', 50), (c) => c.charCodeAt(0)) },
+      { startFrame: 50, calls: Uint8Array.from(repeat('rc', 50), (c) => c.charCodeAt(0)) },
+    ]);
+    expect(split).toEqual(layOutEventTime(calls(repeat('rc', 100))));
+    expect(split.captureRuns).toHaveLength(1);
+    expect(split.extentFrames).toBe(100);
+  });
+
+  it('carries a lagging lane across the boundary and rebases on the far side', () => {
+    // Render falls behind during segment one and only crosses the tolerance
+    // after the INIT. The rebase must still happen.
+    const layout = layOutEventTime(
+      [
+        { startFrame: 0, calls: Uint8Array.from('r' + repeat('c', 8), (c) => c.charCodeAt(0)) },
+        { startFrame: 8, calls: Uint8Array.from(repeat('c', 8) + 'r', (c) => c.charCodeAt(0)) },
+      ],
+      10
+    );
+    expect(layout.gaps).toEqual([
+      {
+        stream: 'render',
+        eventStartFrame: 1,
+        eventEndFrame: 16,
+        nextNativeFrame: 1,
+        observedLagFrames: 15,
+      },
+    ]);
+    expect(frameCount(layout.captureRuns)).toBe(16);
+  });
+
+  it('ignores segments that carried no calls', () => {
+    const layout = layOutEventTime([
+      { startFrame: 0, calls: Uint8Array.from(repeat('rc', 10), (c) => c.charCodeAt(0)) },
+      { startFrame: 10, calls: new Uint8Array(0) },
+      { startFrame: 10, calls: Uint8Array.from(repeat('rc', 10), (c) => c.charCodeAt(0)) },
+    ]);
+    expect(layout.captureRuns).toHaveLength(1);
+    expect(layout.extentFrames).toBe(20);
+  });
+});
+
+describe('repeated rebases', () => {
+  const layout = layOutEventTime(calls(repeat('ccccrrr', 200)), 4);
+
+  it('reports the native frame that resumes after each gap', () => {
+    expect(layout.gaps.length).toBeGreaterThan(10);
+    for (const gap of layout.gaps) {
+      expect(gap.stream).toBe('render');
+      // Everything placed before the gap is exactly what precedes the resume.
+      expect(gap.nextNativeFrame).toBe(framesBefore(layout, gap.eventStartFrame));
+    }
+  });
+
+  it('keeps gaps ordered and non-overlapping within a lane', () => {
+    for (const stream of ['capture', 'render'] as const) {
+      const laneGaps = layout.gaps.filter((g) => g.stream === stream);
+      for (let i = 1; i < laneGaps.length; i++) {
+        expect(laneGaps[i].eventStartFrame).toBeGreaterThanOrEqual(laneGaps[i - 1].eventEndFrame);
+      }
+      for (const gap of laneGaps) {
+        expect(gap.eventEndFrame).toBeGreaterThan(gap.eventStartFrame);
+      }
+    }
+  });
+
+  it('lays out a heavily rebasing dump in linear time', () => {
+    // Every event rebases at zero tolerance, so this is the worst case for any
+    // per-rebase walk over the runs already built.
+    const heavy = calls(repeat('cr', 20_000));
+    const started = performance.now();
+    const result = layOutEventTime(heavy, 0);
+    expect(result.gaps.length).toBeGreaterThan(30_000);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+});
+
+/** Render frames placed before an event slot, for the gap bookkeeping check. */
+function framesBefore(layout: EventTimeLayout, eventFrame: number): number {
+  return layout.renderRuns
+    .filter((r) => r.eventStartFrame < eventFrame)
+    .reduce((t, r) => t + r.frameCount, 0);
+}

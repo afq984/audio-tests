@@ -38,18 +38,22 @@ export type EventStream = 'capture' | 'render';
  * How far a lane may fall behind the frontier before it is rebased, in 10ms
  * frames. 10 frames is 100ms.
  *
- * The value has to sit above the largest healthy delivery batch and below the
- * smallest interruption worth showing, and those two scales are about an order
- * of magnitude apart: batching is 1-10 frames (a 40ms `ccccrrrr` cycle is 4; a
- * bad device buffer reaches 10), while a one-sided stall worth drawing is a
- * perceptible dropout of hundreds of milliseconds. 100ms sits at the top of the
- * batching range, so it is the tightest alignment that still cannot be tripped
- * by ordinary clustering.
+ * A product heuristic, not a derived bound. It has to sit above the largest
+ * healthy delivery batch and below the smallest interruption worth drawing, and
+ * nothing in the dump establishes either edge -- serialization is not
+ * guaranteed to cluster within 100ms, and a real interruption can be shorter
+ * than one. 100ms is a starting value to be confirmed against a corpus of dumps
+ * with known batching and known stalls; the layout records the value it used so
+ * a rendering under a different policy is always reproducible.
  *
- * Being wrong here is visible and adjustable rather than silent: too small and
- * healthy batches gap (see the fixture at exactly this boundary), too large and
- * a real interruption is drawn as steady alignment with the deficit visible
- * only in the call-order lane.
+ * The comparison is strict, so exactly 100ms of lateness still backfills and
+ * 110ms is the first lag that rebases.
+ *
+ * Being wrong here is visible and adjustable rather than silent, but the two
+ * directions are not equally cheap. Too large and a real interruption draws as
+ * steady alignment, with the deficit visible only in the call-order lane. Too
+ * small and both lanes rebase every cycle, each ending up half empty with the
+ * extent doubled -- a much louder failure than a single spurious gap.
  */
 export const DEFAULT_ALLOWED_LATENESS_FRAMES = 10;
 
@@ -98,8 +102,9 @@ class LaneBuilder {
   readonly runs: EventTimeRun[] = [];
   /** Slot this lane would use next if it is allowed to backfill. */
   next = 0;
-  /** Native frames placed so far. */
-  private native = 0;
+  /** Native frames placed so far. Kept incrementally: a rebase must not have
+   *  to walk the runs, or a dump that rebases often lays out quadratically. */
+  native = 0;
   private open: EventTimeRun | null = null;
 
   constructor(readonly stream: EventStream) {}
@@ -127,15 +132,20 @@ class LaneBuilder {
 }
 
 /**
- * Builds the event-time layout for one call-order sequence.
+ * Builds the event-time layout for a dump.
  *
- * Pure: the same calls and the same policy always produce the same runs and
+ * Takes every segment, because event time is continuous across INIT: an INIT
+ * cuts the streams into separately formatted tracks but resets neither clock,
+ * so laying each segment out from zero would silently realign at every
+ * reconfiguration.
+ *
+ * Pure: the same segments and the same policy always produce the same runs and
  * gaps. Characters that are neither `c` nor `r` are ignored, as are INIT,
  * CONFIG and RUNTIME_SETTING events -- they carry no audio, so they occupy no
  * slot.
  */
 export function layOutEventTime(
-  calls: Uint8Array,
+  segments: CallOrderSegment[],
   allowedLatenessFrames: number = DEFAULT_ALLOWED_LATENESS_FRAMES
 ): EventTimeLayout {
   if (Number.isNaN(allowedLatenessFrames) || allowedLatenessFrames < 0) {
@@ -147,29 +157,31 @@ export function layOutEventTime(
   const gaps: EventTimeGap[] = [];
   let frontier = 0;
 
-  for (const call of calls) {
-    let lane: LaneBuilder;
-    if (call === CALL_CAPTURE) lane = capture;
-    else if (call === CALL_RENDER) lane = render;
-    else continue;
+  for (const segment of segments) {
+    for (const call of segment.calls) {
+      let lane: LaneBuilder;
+      if (call === CALL_CAPTURE) lane = capture;
+      else if (call === CALL_RENDER) lane = render;
+      else continue;
 
-    const lag = frontier - lane.next;
-    // A lag equal to the tolerance still backfills; one frame more rebases.
-    if (lag > allowedLatenessFrames) {
-      gaps.push({
-        stream: lane.stream,
-        eventStartFrame: lane.next,
-        eventEndFrame: frontier,
-        nextNativeFrame: nativeFramesPlaced(lane),
-        observedLagFrames: lag,
-      });
-      lane.rebaseTo(frontier);
+      const lag = frontier - lane.next;
+      // A lag equal to the tolerance still backfills; one frame more rebases.
+      if (lag > allowedLatenessFrames) {
+        gaps.push({
+          stream: lane.stream,
+          eventStartFrame: lane.next,
+          eventEndFrame: frontier,
+          nextNativeFrame: lane.native,
+          observedLagFrames: lag,
+        });
+        lane.rebaseTo(frontier);
+      }
+
+      lane.place();
+      // Each event advances the frontier by at most one, so the extent can
+      // never exceed the number of events however badly the policy is chosen.
+      if (lane.next > frontier) frontier = lane.next;
     }
-
-    lane.place();
-    // Each event advances the frontier by at most one, so the extent can never
-    // exceed the number of events however badly the policy is chosen.
-    if (lane.next > frontier) frontier = lane.next;
   }
 
   return {
@@ -181,50 +193,65 @@ export function layOutEventTime(
   };
 }
 
-function nativeFramesPlaced(lane: LaneBuilder): number {
-  return lane.runs.reduce((total, run) => total + run.frameCount, 0);
-}
-
 /** The runs for one lane. */
 export function runsFor(layout: EventTimeLayout, stream: EventStream): EventTimeRun[] {
   return stream === 'capture' ? layout.captureRuns : layout.renderRuns;
 }
 
 /**
- * Native frame to event frame, for drawing a cursor.
+ * Native position to event position, for drawing a cursor.
  *
- * Returns null for a native frame the layout never placed. At a rebase the
- * result jumps over the gap, which is what makes a playing cursor skip empty
- * display space instead of waiting through it.
+ * Positions are fractional frames, not block indices: a cursor part-way through
+ * a block must draw part-way through its slot, and the mapping is slope one
+ * inside a run so the fraction passes straight through.
+ *
+ * Returns null for a position the layout never placed. The position exactly at
+ * the end of the last run is placed -- it is where a finished playback cursor
+ * sits. At a rebase the result jumps over the gap, which is what makes a
+ * playing cursor skip empty display space instead of waiting through it.
  */
 export function toEventFrame(
   layout: EventTimeLayout,
   stream: EventStream,
   nativeFrame: number
 ): number | null {
+  if (!Number.isFinite(nativeFrame)) return null;
   const runs = runsFor(layout, stream);
   const run = findRun(runs, nativeFrame, (r) => r.nativeStartFrame);
-  if (!run) return null;
-  return run.eventStartFrame + (nativeFrame - run.nativeStartFrame);
+  if (run) return run.eventStartFrame + (nativeFrame - run.nativeStartFrame);
+
+  // The exclusive end of the final run: the position a cursor reaches when the
+  // track finishes playing, which no half-open run contains.
+  const last = runs[runs.length - 1];
+  if (last && nativeFrame === last.nativeStartFrame + last.frameCount) {
+    return last.eventStartFrame + last.frameCount;
+  }
+  return null;
 }
 
-/** How a clicked event position was resolved to a native frame. */
+/** How a clicked event position was resolved to a native position. */
 export type SeekResolution = 'exact' | 'snapped-forward' | 'clamped-to-end' | 'empty';
 
 export interface SeekResult {
+  /** Fractional native frame; multiply by the track's samples per frame. */
   nativeFrame: number;
   resolution: SeekResolution;
 }
 
 /**
- * Event frame to native frame, for seeking. Resolved per track.
+ * Event position to native position, for seeking. Resolved per track.
  *
  * Seeking inverts the visible layout rather than consulting the call order
  * again: a second, hidden mapping would land the cursor somewhere the user
- * cannot see a reason for. Inside a run the inverse is exact; inside a gap or
- * before the first run it snaps forward to the next recorded block; past the
- * last run it clamps. The caller should show which of those happened, so a
- * snap is not mistaken for an exact position.
+ * cannot see a reason for.
+ *
+ * Inside a run the inverse is exact and keeps the fractional part, so clicking
+ * part-way through a drawn block selects the sample under the pointer rather
+ * than the start of the block. Inside a gap, or before the first run, it snaps
+ * forward to the first block after it -- an exact block boundary, so the
+ * fraction is deliberately dropped. Past the last run it clamps to the end of
+ * the audio, not to the start of the final block. The caller should show which
+ * of those happened, so a snap is not mistaken for an exact position.
  */
 export function toNativeFrame(
   layout: EventTimeLayout,
@@ -233,23 +260,25 @@ export function toNativeFrame(
 ): SeekResult {
   const runs = runsFor(layout, stream);
   if (runs.length === 0) return { nativeFrame: 0, resolution: 'empty' };
+  if (!Number.isFinite(eventFrame)) {
+    throw new Error(`event time: cannot seek to ${eventFrame}`);
+  }
 
-  const slot = Math.floor(eventFrame);
-  const run = findRun(runs, slot, (r) => r.eventStartFrame);
+  const run = findRun(runs, eventFrame, (r) => r.eventStartFrame);
   if (run) {
     return {
-      nativeFrame: run.nativeStartFrame + (slot - run.eventStartFrame),
+      nativeFrame: run.nativeStartFrame + (eventFrame - run.eventStartFrame),
       resolution: 'exact',
     };
   }
 
-  // Before, or between runs: take the first run that starts after this slot.
-  const next = runs.find((r) => r.eventStartFrame > slot);
+  // Before, or between runs: take the first run that starts after this point.
+  const next = runs.find((r) => r.eventStartFrame > eventFrame);
   if (next) return { nativeFrame: next.nativeStartFrame, resolution: 'snapped-forward' };
 
   const last = runs[runs.length - 1];
   return {
-    nativeFrame: last.nativeStartFrame + last.frameCount - 1,
+    nativeFrame: last.nativeStartFrame + last.frameCount,
     resolution: 'clamped-to-end',
   };
 }
