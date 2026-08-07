@@ -1,16 +1,27 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import WaveSurfer from 'wavesurfer.js';
-import { parseAecDump, DecoderResult } from './decoder.js';
+import { parseDump } from './parse-dump.js';
+import { DumpTrack, ParsedDump, allTracks } from './dump-model.js';
 import { audioBufferToWav } from './wav-helper.js';
 
-interface Track {
-  id: 'ref' | 'mic' | 'out';
+/**
+ * One row in the viewer.
+ *
+ * Tracks come from the dump rather than a fixed set: a dump has as many as its
+ * INIT events produced, they are named the way `unpack_aecdump` names its
+ * files, and a stream that never carried data has no row at all.
+ */
+interface UiTrack {
+  /** Stable identity from the parser: `init1:reverse`. Not the display name,
+   *  which can collide when two INITs are separated by no capture frames. */
+  id: string;
+  /** unpack-style name, e.g. `reverse1200.wav`. */
   name: string;
+  /** Safe for an element id and a CSS selector; `id` contains a colon. */
+  domId: string;
+  source: DumpTrack;
   ws: WaveSurfer | null;
-  muted: boolean;
-  soloed: boolean;
-  volume: number;
   url: string | null;
 }
 
@@ -22,11 +33,16 @@ export class AecDumpViewer extends LitElement {
   @state() private duration = 0;
   @state() private currentTime = 0;
 
-  @state() private tracks: Record<string, Track> = {
-    ref: { id: 'ref', name: 'Reference (Playout)', ws: null, muted: false, soloed: false, volume: 1.0, url: null },
-    mic: { id: 'mic', name: 'Microphone Input', ws: null, muted: false, soloed: false, volume: 1.0, url: null },
-    out: { id: 'out', name: 'Processed Output', ws: null, muted: false, soloed: false, volume: 1.0, url: null },
-  };
+  @state() private tracks: UiTrack[] = [];
+  @state() private warnings: string[] = [];
+  /**
+   * The one track connected to audio output.
+   *
+   * Playing every track at once is a DAW feature with no use here -- the
+   * streams are different points in one signal chain, not parts of a mix, and
+   * hearing them summed tells you nothing. Seeking still moves every track.
+   */
+  @state() private audibleTrackId: string | null = null;
 
   private audioCtx: AudioContext | null = null;
   private syncSeeking = false;
@@ -192,28 +208,26 @@ export class AecDumpViewer extends LitElement {
       font-size: 12px;
     }
 
-    .track-controls button.mute.active {
-      background: #f28b82;
-      color: #b00020;
-      border-color: #f28b82;
+    .track-controls button.listen.active {
+      background: #1a73e8;
+      color: white;
+      border-color: #1a73e8;
     }
 
-    .track-controls button.solo.active {
-      background: #fdd663;
-      color: #875900;
-      border-color: #fdd663;
-    }
-
-    .volume-slider {
-      display: flex;
-      align-items: center;
-      gap: 5px;
+    .track-meta {
+      font-family: monospace;
       font-size: 12px;
       color: #5f6368;
     }
 
-    .volume-slider input {
-      width: 80px;
+    .warnings {
+      margin: 0 0 20px 0;
+      padding: 10px 15px 10px 32px;
+      border-radius: 4px;
+      background: #fef7e0;
+      color: #875900;
+      border: 1px solid #fdd663;
+      font-size: 13px;
     }
 
     .track-body {
@@ -231,12 +245,12 @@ export class AecDumpViewer extends LitElement {
   `;
 
   override render() {
-    const hasTracks = Object.values(this.tracks).some(t => t.url !== null);
+    const hasTracks = this.tracks.length > 0;
 
     return html`
       <header>
-        <h1>AECDump Web Viewer (V1)</h1>
-        <p class="description">In-browser parser and synchronized waveform player for WebRTC APM audio dumps.</p>
+        <h1>AECDump Web Viewer</h1>
+        <p class="description">In-browser replacement for unpack_aecdump: decodes a dump to its streams, names them the way unpack does, and plays them.</p>
       </header>
 
       <div 
@@ -252,6 +266,12 @@ export class AecDumpViewer extends LitElement {
 
       ${this.loadingStatus ? html`<div class="status">${this.loadingStatus}</div>` : ''}
 
+      ${this.warnings.length > 0 ? html`
+        <ul class="warnings" id="warnings">
+          ${this.warnings.map(w => html`<li>${w}</li>`)}
+        </ul>
+      ` : ''}
+
       ${hasTracks ? html`
         <div class="controls">
           <button @click=${this.togglePlay}>${this.isPlaying ? 'Pause' : 'Play'}</button>
@@ -263,49 +283,37 @@ export class AecDumpViewer extends LitElement {
         </div>
 
         <div class="tracks-container">
-          ${Object.values(this.tracks).map(track => this.renderTrackCard(track))}
+          ${this.tracks.map(track => this.renderTrackCard(track))}
         </div>
       ` : ''}
     `;
   }
 
-  private renderTrackCard(track: Track) {
-    if (!track.url) return '';
-
+  private renderTrackCard(track: UiTrack) {
+    const audible = track.id === this.audibleTrackId;
     return html`
       <div class="track-card">
         <div class="track-header">
           <span class="track-title">${track.name}</span>
-          
-          <div class="track-controls">
-            <div class="volume-slider">
-              <span>Vol:</span>
-              <input 
-                type="range" 
-                min="0" 
-                max="1" 
-                step="0.05" 
-                .value=${track.volume.toString()}
-                @input=${(e: Event) => this.onVolumeChange(track.id, e)}
-              >
-            </div>
 
-            <button 
-              class="secondary mute ${track.muted ? 'active' : ''}" 
-              @click=${() => this.toggleMute(track.id)}
+          <div class="track-controls">
+            <span class="track-meta">
+              ${track.source.sampleRate} Hz
+              ${track.source.channels > 1 ? html`&times;${track.source.channels}` : ''}
+              &middot; ${track.source.duration.toFixed(2)}s
+              &middot; ${track.source.timeline}
+            </span>
+            <button
+              class="secondary listen ${audible ? 'active' : ''}"
+              id="listen-${track.domId}"
+              @click=${() => this.setAudibleTrack(track.id)}
             >
-              Mute
-            </button>
-            <button 
-              class="secondary solo ${track.soloed ? 'active' : ''}" 
-              @click=${() => this.toggleSolo(track.id)}
-            >
-              Solo
+              ${audible ? 'Listening' : 'Listen'}
             </button>
           </div>
         </div>
         <div class="track-body">
-          <div class="waveform-container" id="waveform-${track.id}"></div>
+          <div class="waveform-container" id="waveform-${track.domId}"></div>
         </div>
       </div>
     `;
@@ -342,6 +350,7 @@ export class AecDumpViewer extends LitElement {
     this.loadingStatus = `Loading file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...`;
     this.stopAll();
     this.destroyWaveSurfers();
+    this.warnings = [];
 
     try {
       const arrayBuffer = await file.arrayBuffer();
@@ -350,7 +359,8 @@ export class AecDumpViewer extends LitElement {
       // Small delay to allow UI to update
       await new Promise(resolve => setTimeout(resolve, 50));
       
-      const parsed = parseAecDump(arrayBuffer);
+      const parsed = parseDump(arrayBuffer);
+      this.warnings = parsed.warnings;
       
       this.loadingStatus = 'Decoding audio and preparing tracks...';
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -365,45 +375,49 @@ export class AecDumpViewer extends LitElement {
     }
   }
 
-  // Convert parsed raw PCM streams into WAV Blob URLs
-  private async initializeTracks(parsed: DecoderResult) {
+  /** Builds one row per track the dump actually contains. */
+  private async initializeTracks(dump: ParsedDump) {
     if (!this.audioCtx) {
       this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
 
-    // Helper to convert ParsedAudioStream to Blob URL
-    const createWavUrl = (stream: typeof parsed.reference) => {
-      if (stream.channelData.length === 0 || stream.channelData[0].length === 0) {
-        return null;
-      }
-      // Create AudioBuffer
+    const wavUrl = (track: DumpTrack): string | null => {
+      if (track.channelData.length === 0 || track.channelData[0].length === 0) return null;
       const buffer = this.audioCtx!.createBuffer(
-        stream.channels,
-        stream.channelData[0].length,
-        stream.sampleRate
+        track.channels,
+        track.channelData[0].length,
+        track.sampleRate
       );
-      for (let c = 0; c < stream.channels; c++) {
-        buffer.copyToChannel(stream.channelData[c] as any, c);
+      for (let c = 0; c < track.channels; c++) {
+        buffer.copyToChannel(track.channelData[c] as any, c);
       }
-      // Encode to WAV
-      const wavBytes = audioBufferToWav(buffer);
-      const blob = new Blob([wavBytes], { type: 'audio/wav' });
+      const blob = new Blob([audioBufferToWav(buffer)], { type: 'audio/wav' });
       return URL.createObjectURL(blob);
     };
 
-    // Generate URLs
-    const refUrl = createWavUrl(parsed.reference);
-    const micUrl = createWavUrl(parsed.input);
-    const outUrl = createWavUrl(parsed.output);
+    this.tracks = allTracks(dump).flatMap((source) => {
+      const url = wavUrl(source);
+      if (!url) return [];
+      return [
+        {
+          id: source.id,
+          name: source.name,
+          // The parser's id carries a colon, which is not usable unescaped in
+          // a CSS selector.
+          domId: source.id.replace(/[^a-zA-Z0-9_-]/g, '-'),
+          source,
+          ws: null,
+          url,
+        },
+      ];
+    });
 
-    // Update track state
-    this.tracks = {
-      ref: { ...this.tracks.ref, url: refUrl },
-      mic: { ...this.tracks.mic, url: micUrl },
-      out: { ...this.tracks.out, url: outUrl },
-    };
+    // Default to the microphone input: it is what a user opening a dump is
+    // usually looking for, and it exists in every dump that captured anything.
+    const preferred =
+      this.tracks.find((t) => t.source.kind === 'input') ?? this.tracks[0] ?? null;
+    this.audibleTrackId = preferred ? preferred.id : null;
 
-    // Request Lit update so track-cards render, then initialize WaveSurfers on the DOM
     this.requestUpdate();
     await this.updateComplete;
 
@@ -421,31 +435,21 @@ export class AecDumpViewer extends LitElement {
       normalize: true,
     };
 
-    // Initialize each active track
-    Object.values(this.tracks).forEach(track => {
-      if (!track.url) return;
+    for (const track of this.tracks) {
+      const container = this.shadowRoot?.getElementById(`waveform-${track.domId}`);
+      if (!container || !track.url) continue;
 
-      const container = this.shadowRoot?.getElementById(`waveform-${track.id}`);
-      if (!container) return;
-
-      const ws = WaveSurfer.create({
-        ...wsOptions,
-        container: container,
-        url: track.url,
-      });
-
+      const ws = WaveSurfer.create({ ...wsOptions, container, url: track.url });
       track.ws = ws;
+      ws.setMuted(track.id !== this.audibleTrackId);
 
-      // Sync Mute/Volume state
-      ws.setMuted(track.muted);
-      ws.setVolume(track.volume);
-
-      // Bind events
-      if (track.id === 'mic') {
-        // Use mic as master track for duration/currentTime state updates
-        ws.on('ready', (duration) => {
-          this.duration = duration;
-        });
+      // The longest track drives the transport clock. Every track is on its own
+      // native clock and they need not be the same length, so taking the first
+      // one would stop the display short of a longer stream.
+      ws.on('ready', (duration) => {
+        this.duration = Math.max(this.duration, duration);
+      });
+      if (track.id === this.audibleTrackId) {
         ws.on('timeupdate', (time) => {
           this.currentTime = time;
         });
@@ -462,21 +466,16 @@ export class AecDumpViewer extends LitElement {
       ws.on('interaction', (newTime) => {
         if (this.syncSeeking) return;
         this.syncSeeking = true;
-
-        const time = newTime;
-        Object.values(this.tracks).forEach(t => {
-          if (t.id !== track.id && t.ws) {
-            t.ws.setTime(time);
-          }
-        });
-        
+        for (const other of this.tracks) {
+          if (other.id !== track.id && other.ws) other.ws.setTime(newTime);
+        }
         this.syncSeeking = false;
       });
-    });
+    }
   }
 
   private destroyWaveSurfers() {
-    Object.values(this.tracks).forEach(track => {
+    for (const track of this.tracks) {
       if (track.ws) {
         track.ws.destroy();
         track.ws = null;
@@ -485,7 +484,8 @@ export class AecDumpViewer extends LitElement {
         URL.revokeObjectURL(track.url);
         track.url = null;
       }
-    });
+    }
+    this.tracks = [];
     this.isPlaying = false;
     this.duration = 0;
     this.currentTime = 0;
@@ -493,68 +493,31 @@ export class AecDumpViewer extends LitElement {
 
   // Master controls
   private togglePlay() {
-    const activeWs = Object.values(this.tracks).map(t => t.ws).filter(Boolean) as WaveSurfer[];
-    if (activeWs.length === 0) return;
+    if (this.tracks.length === 0) return;
 
     if (this.isPlaying) {
-      activeWs.forEach(ws => ws.pause());
+      for (const track of this.tracks) track.ws?.pause();
       this.isPlaying = false;
-    } else {
-      // Play all
-      activeWs.forEach(ws => ws.play());
-      this.isPlaying = true;
+      return;
     }
+    // Every track advances so the cursors stay together, but only the audible
+    // one is unmuted -- summing points in one signal chain is not a mix.
+    for (const track of this.tracks) track.ws?.play();
+    this.isPlaying = true;
   }
 
   private stopAll() {
-    Object.values(this.tracks).forEach(t => {
-      if (t.ws) {
-        t.ws.stop();
-      }
-    });
+    for (const track of this.tracks) track.ws?.stop();
     this.isPlaying = false;
     this.currentTime = 0;
   }
 
-  // Track controls
-  private onVolumeChange(id: 'ref' | 'mic' | 'out', e: Event) {
-    const value = parseFloat((e.target as HTMLInputElement).value);
-    const track = this.tracks[id];
-    track.volume = value;
-    if (track.ws) {
-      track.ws.setVolume(value);
+  /** Moves audio output to one track, leaving every cursor where it is. */
+  private setAudibleTrack(id: string) {
+    this.audibleTrackId = id;
+    for (const track of this.tracks) {
+      track.ws?.setMuted(track.id !== id);
     }
-    this.requestUpdate();
-  }
-
-  private toggleMute(id: 'ref' | 'mic' | 'out') {
-    const track = this.tracks[id];
-    track.muted = !track.muted;
-    if (track.ws) {
-      track.ws.setMuted(track.muted);
-    }
-    this.requestUpdate();
-  }
-
-  private toggleSolo(id: 'ref' | 'mic' | 'out') {
-    const track = this.tracks[id];
-    track.soloed = !track.soloed;
-
-    const hasSoloedTracks = Object.values(this.tracks).some(t => t.soloed);
-
-    Object.values(this.tracks).forEach(t => {
-      if (!t.ws) return;
-      
-      if (hasSoloedTracks) {
-        // If there are soloed tracks, mute this track unless it is soloed
-        t.ws.setMuted(!t.soloed);
-      } else {
-        // Otherwise restore the track's own mute state
-        t.ws.setMuted(t.muted);
-      }
-    });
-
-    this.requestUpdate();
   }
 
   private formatTime(seconds: number): string {
