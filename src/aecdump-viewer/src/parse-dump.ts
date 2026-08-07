@@ -169,6 +169,7 @@ class SegmentBuilder {
   constructor(
     readonly initIndex: number,
     readonly startFrame: number,
+    readonly startRenderFrame: number,
     readonly formats: Record<TrackKind, SegmentFormat>,
     readonly timestampMs?: number
   ) {
@@ -198,6 +199,9 @@ class SegmentBuilder {
       }
       const channelData = acc.channelAccumulators.map((c) => c.merged());
       const frames = channelData[0]?.length ?? 0;
+      // Native origin: a render track counts render frames, a capture track
+      // counts capture frames. They diverge whenever the clocks are not locked.
+      const nativeStartFrame = kind === 'reverse' ? this.startRenderFrame : this.startFrame;
       tracks.push({
         kind,
         timeline: kind === 'reverse' ? 'render' : 'capture',
@@ -207,12 +211,12 @@ class SegmentBuilder {
         sampleRate: acc.sampleRate,
         channels: acc.channels,
         channelData,
-        startFrame: this.startFrame,
+        startFrame: nativeStartFrame,
         // Native position only. A render track is NOT projected onto capture
         // coordinates here: the call order records serialization order, not
         // clock measurements, so any warp is an estimate applied at display
         // time through a TrackTransform.
-        startTime: framesToSeconds(this.startFrame),
+        startTime: framesToSeconds(nativeStartFrame),
         duration: frames / acc.sampleRate,
       });
     }
@@ -220,6 +224,7 @@ class SegmentBuilder {
     return {
       initIndex: this.initIndex,
       startFrame: this.startFrame,
+      startRenderFrame: this.startRenderFrame,
       frameCount: this.frameCount,
       timestampMs: this.timestampMs,
       formats: this.formats,
@@ -391,6 +396,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
   let offset = 0;
   let eventCount = 0;
   let captureFrameCount = 0;
+  let renderFrameCount = 0;
   let initCount = 0;
   let current: SegmentBuilder | null = null;
 
@@ -440,7 +446,13 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         const formats = formatsFromInit(init, initCount, warnings);
         if (!formats) break;
         const timestampMs = optionalInt64(init, 'timestampMs');
-        current = new SegmentBuilder(initCount, captureFrameCount, formats, timestampMs);
+        current = new SegmentBuilder(
+          initCount,
+          captureFrameCount,
+          renderFrameCount,
+          formats,
+          timestampMs
+        );
         markers.push({
           kind: 'init',
           frame: captureFrameCount,
@@ -488,7 +500,11 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
 
       case Event.Type.REVERSE_STREAM: {
         const rev = event.reverseStream;
-        if (!rev || !current) break;
+        if (!rev) break;
+        // Counted even before the first INIT, so a render track's native origin
+        // stays right for every later segment.
+        renderFrameCount++;
+        if (!current) break;
         current.calls.push(CALL_RENDER);
         // Capture calls completed *before* this render call. Recording it
         // before appending fixes the boundary convention: a render call that

@@ -219,3 +219,37 @@ describe('capture-coordinate projection', () => {
     expect(dump.captureFrameCount).toBe(4);
   });
 });
+
+describe('native track origins', () => {
+  it('keeps render and capture origins separate across segments', () => {
+    const dump = parseDump(
+      makeSegmentedDump([
+        { frames: 100, sampleRate: RATE, reverseOnlyFrames: 100 },
+        { frames: 50, sampleRate: RATE },
+      ])
+    );
+    const [first, second] = dump.segments;
+    // Segment one carries 200 render calls (100 extra plus one per capture)
+    // against 100 capture frames.
+    expect(first.startRenderFrame).toBe(0);
+    expect(second.startFrame).toBe(100);
+    expect(second.startRenderFrame).toBe(200);
+
+    const reverse = second.tracks.find((t) => t.kind === 'reverse')!;
+    const input = second.tracks.find((t) => t.kind === 'input')!;
+    expect(reverse.startTime).toBeCloseTo(2.0, 9);
+    expect(input.startTime).toBeCloseTo(1.0, 9);
+  });
+
+  it('leaves both origins equal when the clocks stay locked', () => {
+    const dump = parseDump(
+      makeSegmentedDump([
+        { frames: 100, sampleRate: RATE },
+        { frames: 50, sampleRate: RATE },
+      ])
+    );
+    const second = dump.segments[1];
+    expect(second.startRenderFrame).toBe(second.startFrame);
+    expect(second.tracks.find((t) => t.kind === 'reverse')!.startTime).toBeCloseTo(1.0, 9);
+  });
+});

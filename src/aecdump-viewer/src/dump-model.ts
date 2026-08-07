@@ -54,7 +54,13 @@ export interface DumpTrack {
   channels: number;
   /** One Float32Array per channel, samples in [-1, 1]. */
   channelData: Float32Array[];
-  /** Capture frame index where this track's segment begins. */
+  /**
+   * Frame index where this track begins **on its own clock**: capture frames
+   * for a `capture` track, render frames for a `render` one. Those diverge
+   * whenever the two streams deliver different amounts of audio, so using the
+   * capture count for both would misplace reverse in every dump where the
+   * clocks are not locked.
+   */
   startFrame: number;
   /**
    * Seconds from the start of this track's own clock.
@@ -79,6 +85,8 @@ export interface DumpSegment {
   initIndex: number;
   /** Cumulative capture frame count when this INIT was seen. */
   startFrame: number;
+  /** Cumulative render frame count when this INIT was seen. */
+  startRenderFrame: number;
   /** Capture frames belonging to this segment. */
   frameCount: number;
   /** Wall-clock stamp from the INIT event, when the dump carries one. */
