@@ -23,6 +23,16 @@ interface UiTrack {
   source: DumpTrack;
   /** Largest absolute sample across every channel, in [0, 1]. */
   peak: number;
+  /**
+   * Vertical scale for drawing only; playback and export are untouched.
+   *
+   * 1 draws at absolute scale, so heights are comparable between tracks. One
+   * fixed scale cannot serve both jobs: a capture stream 25dB below the playout
+   * reference is a flat line at absolute scale, and scaling every track to its
+   * own peak makes a near-silent one look identical to a loud one. So the
+   * default is honest and the zoom is per track, as in Audacity.
+   */
+  gain: number;
   ws: WaveSurfer | null;
   url: string | null;
 }
@@ -227,6 +237,12 @@ export class AecDumpViewer extends LitElement {
       font-size: 12px;
     }
 
+    .track-controls button.zoom.active {
+      background: #e8f0fe;
+      color: #1a73e8;
+      border-color: #a8c7fa;
+    }
+
     .track-controls button.listen.active {
       background: #1a73e8;
       color: white;
@@ -323,6 +339,14 @@ export class AecDumpViewer extends LitElement {
               &middot; ${track.source.timeline}
               &middot; peak ${formatDbfs(track.peak)}
             </span>
+            <button
+              class="secondary zoom ${track.gain > 1 ? 'active' : ''}"
+              id="zoom-${track.domId}"
+              title="Vertical zoom. Drawing only -- playback is unchanged."
+              @click=${() => this.toggleGain(track.id)}
+            >
+              ${track.gain > 1 ? `${track.gain.toFixed(0)}\u00d7` : 'Fit'}
+            </button>
             <button
               class="secondary listen ${audible ? 'active' : ''}"
               id="listen-${track.domId}"
@@ -427,6 +451,7 @@ export class AecDumpViewer extends LitElement {
           domId: source.id.replace(/[^a-zA-Z0-9_-]/g, '-'),
           source,
           peak: peakOf(source),
+          gain: 1,
           ws: null,
           url,
         },
@@ -537,6 +562,22 @@ export class AecDumpViewer extends LitElement {
     for (const track of this.tracks) track.ws?.stop();
     this.isPlaying = false;
     this.currentTime = 0;
+  }
+
+  /**
+   * Toggles a track between absolute scale and filling its lane.
+   *
+   * Fit scales by 1/peak, which is what normalization would have done, except
+   * it is asked for rather than applied to every track silently -- and the peak
+   * stays on screen beside it, so a track that needed 30dB of zoom says so.
+   */
+  private toggleGain(id: string) {
+    this.tracks = this.tracks.map((track) => {
+      if (track.id !== id) return track;
+      const gain = track.gain > 1 || track.peak <= 0 ? 1 : 1 / track.peak;
+      track.ws?.setOptions({ barHeight: gain });
+      return { ...track, gain };
+    });
   }
 
   /** Moves audio output to one track, leaving every cursor where it is. */
