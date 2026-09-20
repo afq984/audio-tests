@@ -644,4 +644,33 @@ describe('native origins', () => {
   it('lays out nothing for no segments', () => {
     expect(layOutEventTime([])).toMatchObject({ extentFrames: 0, gaps: [] });
   });
+
+  it('resyncs native frame counters when a rejected mid-dump INIT skips frames', () => {
+    // Segment 1 runs 10 capture and 10 render frames (0..9).
+    // A rejected mid-dump INIT then consumes 5 capture and 4 render frames globally,
+    // so the next valid segment starts at capture frame 15 and render frame 14.
+    const layout = layOutEventTime([
+      seg(repeat('rc', 10), 0, 0),
+      seg(repeat('rc', 10), 15, 14),
+    ]);
+    expect(layout.captureRuns).toEqual([
+      { nativeStartFrame: 0, eventStartFrame: 0, frameCount: 10 },
+      { nativeStartFrame: 15, eventStartFrame: 10, frameCount: 10 },
+    ]);
+    expect(layout.renderRuns).toEqual([
+      { nativeStartFrame: 0, eventStartFrame: 0, frameCount: 10 },
+      { nativeStartFrame: 14, eventStartFrame: 10, frameCount: 10 },
+    ]);
+    expect(toEventFrame(layout, 'capture', 15)).toBe(10);
+    expect(toEventFrame(layout, 'render', 14)).toBe(10);
+    expect(toNativeFrame(layout, 'capture', 10)).toEqual({
+      nativeFrame: 15,
+      resolution: 'exact',
+    });
+    expect(toNativeFrame(layout, 'render', 10)).toEqual({
+      nativeFrame: 14,
+      resolution: 'exact',
+    });
+  });
 });
+

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseDump } from '../../src/parse-dump.js';
+import { webrtc } from '../../src/proto/debug.js';
 import { CALL_RENDER, allTracks, dumpDuration, framesToSeconds } from '../../src/dump-model.js';
 import {
   makeCallOrderDump,
@@ -407,4 +408,81 @@ describe('call order origins', () => {
     expect(dump.callOrder[1].startRenderFrame).toBe(8);
     expect(dump.segments[1].startRenderFrame).toBe(8);
   });
+
+  it('does not advance renderFrameCount or mark droppedBeforeInit for sample-less pre-INIT reverse events', () => {
+    const validDump = new Uint8Array(makeSegmentedDump([{ frames: 2, sampleRate: RATE }]));
+    const encodeMsg = (ev: webrtc.audioproc.IEvent) => {
+      const body = webrtc.audioproc.Event.encode(ev).finish();
+      const out = new Uint8Array(4 + body.length);
+      new DataView(out.buffer).setInt32(0, body.length, true);
+      out.set(body, 4);
+      return out;
+    };
+    const preRevSubSample = encodeMsg({
+      type: webrtc.audioproc.Event.Type.REVERSE_STREAM,
+      reverseStream: { data: new Uint8Array([0xff]) },
+    });
+    const preRevEmptyChan = encodeMsg({
+      type: webrtc.audioproc.Event.Type.REVERSE_STREAM,
+      reverseStream: { channel: [new Uint8Array(2)] },
+    });
+    const combined = new Uint8Array(
+      preRevSubSample.length + preRevEmptyChan.length + validDump.length
+    );
+    combined.set(preRevSubSample, 0);
+    combined.set(preRevEmptyChan, preRevSubSample.length);
+    combined.set(validDump, preRevSubSample.length + preRevEmptyChan.length);
+
+    const parsed = parseDump(combined.buffer);
+    expect(parsed.segments[0].startRenderFrame).toBe(0);
+    expect(parsed.callOrder[0].startRenderFrame).toBe(0);
+  });
+
+  it('handles non-multiple-of-4 float channel payloads and ignores empty/1-byte STREAM payloads', () => {
+    const encodeMsg = (ev: webrtc.audioproc.IEvent) => {
+      const body = webrtc.audioproc.Event.encode(ev).finish();
+      const out = new Uint8Array(4 + body.length);
+      new DataView(out.buffer).setInt32(0, body.length, true);
+      out.set(body, 4);
+      return out;
+    };
+    const init = encodeMsg({
+      type: webrtc.audioproc.Event.Type.INIT,
+      init: {
+        sampleRate: RATE,
+        numInputChannels: 1,
+        numOutputChannels: 1,
+        numReverseChannels: 1,
+      },
+    });
+    // STREAM with 10 floats + 3 trailing bytes on input, and 1-byte outputData (0 samples)
+    const stream1 = encodeMsg({
+      type: webrtc.audioproc.Event.Type.STREAM,
+      stream: {
+        inputChannel: [new Uint8Array(10 * 4 + 3)],
+        outputData: new Uint8Array([0x01]),
+      },
+    });
+    // STREAM with empty outputChannel [Uint8Array(0)]
+    const stream2 = encodeMsg({
+      type: webrtc.audioproc.Event.Type.STREAM,
+      stream: {
+        inputChannel: [new Uint8Array(PER_FRAME * 4)],
+        outputChannel: [new Uint8Array(0)],
+      },
+    });
+    const total = init.length + stream1.length + stream2.length;
+    const buf = new Uint8Array(total);
+    buf.set(init, 0);
+    buf.set(stream1, init.length);
+    buf.set(stream2, init.length + stream1.length);
+
+    const parsed = parseDump(buf.buffer);
+    expect(parsed.segments).toHaveLength(1);
+    const tracks = parsed.segments[0].tracks;
+    expect(tracks.find((t) => t.kind === 'input')).toBeDefined();
+    // ref_out never had > 0 decoded samples, so it must not be emitted
+    expect(tracks.find((t) => t.kind === 'ref_out')).toBeUndefined();
+  });
 });
+

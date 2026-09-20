@@ -35,32 +35,36 @@ function readWavHeader(wav: ArrayBuffer) {
 
 describe('audioBufferToWav', () => {
   it.each([1, 2, 3, 4, 8])(
-    'writes a header describing the data actually written (%i channels)',
+    'preserves all %i channels and writes interleaved frames',
     (numChannels) => {
-      // A header claiming N channels for downmixed mono data makes the file
-      // play N times too fast and come out 1/N the length.
-      const header = readWavHeader(audioBufferToWav(fakeBuffer(numChannels)));
+      const buf = fakeBuffer(numChannels);
+      const wav = audioBufferToWav(buf);
+      const header = readWavHeader(wav);
+      expect(header.channels).toBe(numChannels);
       expect(header.durationMs).toBeCloseTo(100, 6);
       expect(header.sampleRate).toBe(RATE);
       expect(header.frames).toBe(FRAMES);
+
+      // Verify sample interleaving in 16-bit PCM data at frame 5
+      const view = new DataView(wav);
+      const frameIdx = 5;
+      for (let c = 0; c < numChannels; c++) {
+        const expectedFloat = buf.getChannelData(c)[frameIdx];
+        const clamped = Math.max(-1, Math.min(1, expectedFloat));
+        const expectedInt16 = Math.trunc(clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff);
+        const byteOffset = 44 + (frameIdx * numChannels + c) * 2;
+        expect(view.getInt16(byteOffset, true)).toBe(expectedInt16);
+      }
     }
   );
 
-  it('keeps both channels for stereo', () => {
-    const header = readWavHeader(audioBufferToWav(fakeBuffer(2)));
-    expect(header.channels).toBe(2);
-  });
-
-  it('downmixes more than two channels to mono', () => {
-    const header = readWavHeader(audioBufferToWav(fakeBuffer(4)));
-    expect(header.channels).toBe(1);
-  });
-
   it('writes 16-bit PCM by default and 32-bit float on request', () => {
     expect(readWavHeader(audioBufferToWav(fakeBuffer(1))).bitDepth).toBe(16);
-    const float = audioBufferToWav(fakeBuffer(1), { float32: true });
+    const float = audioBufferToWav(fakeBuffer(3), { float32: true });
     const header = readWavHeader(float);
+    expect(header.channels).toBe(3);
     expect(header.bitDepth).toBe(32);
     expect(header.durationMs).toBeCloseTo(100, 6);
   });
 });
+

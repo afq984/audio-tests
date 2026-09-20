@@ -141,17 +141,38 @@ class StreamAccumulator {
     const actualChannels = Math.min(this.channels, channelsBytes.length);
     for (let c = 0; c < actualChannels; c++) {
       const bytes = channelsBytes[c];
+      const count = bytes.byteLength >> 2;
       let floatData: Float32Array;
       if (bytes.byteOffset % 4 === 0) {
-        floatData = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+        floatData = new Float32Array(bytes.buffer, bytes.byteOffset, count);
       } else {
         const copy = new Uint8Array(bytes.byteLength);
         copy.set(bytes);
-        floatData = new Float32Array(copy.buffer, 0, copy.byteLength / 4);
+        floatData = new Float32Array(copy.buffer, 0, count);
       }
       this.channelAccumulators[c].append(floatData);
     }
   }
+}
+
+function decodedSamples(
+  data: Uint8Array | null | undefined,
+  channel: Uint8Array[] | null | undefined,
+  format: SegmentFormat
+): number {
+  if (data && data.byteLength > 0) {
+    return Math.floor((data.byteLength >> 1) / format.channels);
+  }
+  if (channel && channel.length > 0) {
+    const actualChannels = Math.min(format.channels, channel.length);
+    let maxSamples = 0;
+    for (let c = 0; c < actualChannels; c++) {
+      const count = channel[c].byteLength >> 2;
+      if (count > maxSamples) maxSamples = count;
+    }
+    return maxSamples;
+  }
+  return 0;
 }
 
 /** A segment under construction. */
@@ -393,6 +414,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
   let initCount = 0;
   let emptyReverseEvents = 0;
   let malformedReverseEvents = 0;
+  let droppedBeforeInit = false;
   let current: SegmentBuilder | null = null;
 
   const closeCurrent = () => {
@@ -535,23 +557,30 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
             : null;
         const carriedSomething =
           (rev.data && rev.data.length > 0) || (rev.channel && rev.channel.length > 0);
+        const hasSamples =
+          (rev.data?.byteLength ?? 0) >= 2 ||
+          (rev.channel?.some((ch) => ch.byteLength >= 4) ?? false);
         if (current && !int16 && !float) {
           if (carriedSomething) malformedReverseEvents++;
           else emptyReverseEvents++;
           break;
         }
-        if (!current && !carriedSomething) {
+        if (!current && !hasSamples) {
           // Before the first valid INIT there is no format to check against, so
-          // only the unambiguous case can be judged. Skipping it keeps the
-          // global render origin equal to the number of frames actually
-          // modelled, which is what the layout numbers its lanes by.
-          emptyReverseEvents++;
+          // check whether the payload carries at least one decodable sample.
+          // Skipping empty or sub-sample payloads keeps the global render
+          // origin equal to the number of frames actually modelled.
+          if (carriedSomething) malformedReverseEvents++;
+          else emptyReverseEvents++;
           break;
         }
         // Counted even before the first INIT, so a render track's native origin
         // stays right for every later segment.
         renderFrameCount++;
-        if (!current) break;
+        if (!current) {
+          droppedBeforeInit = true;
+          break;
+        }
         current.calls.push(CALL_RENDER);
         const acc = current.accumulators.reverse;
         if (int16) acc.appendInterleavedInt16(int16);
@@ -564,7 +593,10 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         // The frame counter advances for every STREAM event, even one that
         // arrives before the first INIT, so names stay aligned with upstream.
         const frameIndex = captureFrameCount++;
-        if (!stream || !current) break;
+        if (!stream || !current) {
+          if (stream) droppedBeforeInit = true;
+          break;
+        }
         current.calls.push(CALL_CAPTURE);
 
         // The metadata series are indexed by capture frame, so they line up
@@ -581,21 +613,23 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
         // Pad up to this frame's position before appending, so an event that
         // carries only one stream does not shift the other out of lockstep.
         const input = current.accumulators.input;
-        if (stream.inputData && stream.inputData.length > 0) {
+        if (decodedSamples(stream.inputData, stream.inputChannel, current.formats.input) > 0) {
           input.padTo(current.offsetFor('input', frameIndex));
-          input.appendInterleavedInt16(stream.inputData);
-        } else if (stream.inputChannel && stream.inputChannel.length > 0) {
-          input.padTo(current.offsetFor('input', frameIndex));
-          input.appendDeinterleavedFloat(stream.inputChannel);
+          if (stream.inputData && stream.inputData.length > 0) {
+            input.appendInterleavedInt16(stream.inputData);
+          } else if (stream.inputChannel && stream.inputChannel.length > 0) {
+            input.appendDeinterleavedFloat(stream.inputChannel);
+          }
         }
 
         const output = current.accumulators.ref_out;
-        if (stream.outputData && stream.outputData.length > 0) {
+        if (decodedSamples(stream.outputData, stream.outputChannel, current.formats.ref_out) > 0) {
           output.padTo(current.offsetFor('ref_out', frameIndex));
-          output.appendInterleavedInt16(stream.outputData);
-        } else if (stream.outputChannel && stream.outputChannel.length > 0) {
-          output.padTo(current.offsetFor('ref_out', frameIndex));
-          output.appendDeinterleavedFloat(stream.outputChannel);
+          if (stream.outputData && stream.outputData.length > 0) {
+            output.appendInterleavedInt16(stream.outputData);
+          } else if (stream.outputChannel && stream.outputChannel.length > 0) {
+            output.appendDeinterleavedFloat(stream.outputChannel);
+          }
         }
         break;
       }
@@ -629,7 +663,7 @@ export function parseDump(arrayBuffer: ArrayBuffer): ParsedDump {
     );
   }
 
-  if (segments.length === 0 && captureFrameCount > 0) {
+  if (segments.length === 0 && (captureFrameCount > 0 || droppedBeforeInit)) {
     warnings.push('The dump contains audio but no INIT event, so its format is unknown.');
   }
 

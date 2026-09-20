@@ -10,22 +10,17 @@ export function audioBufferToWav(buffer: AudioBuffer, opt?: { float32?: boolean 
   const bitDepth = format === 3 ? 32 : 16;
 
   let result: Float32Array;
-  // The header must describe the data we actually write, not the source buffer:
-  // claiming N channels for mono samples makes the file play N times too fast.
-  let outChannels = numChannels;
-  if (numChannels === 2) {
-    result = interleave(buffer.getChannelData(0), buffer.getChannelData(1));
-  } else if (numChannels > 2) {
-    // For V1, if more than 2 channels, we just take the first one, or we could interleave all.
-    // Let's take the first one for simplicity, or we can log a warning.
-    console.warn(`audioBufferToWav: ${numChannels} channels detected. Downmixing to mono (first channel) for V1.`);
+  if (numChannels === 1) {
     result = buffer.getChannelData(0);
-    outChannels = 1;
   } else {
-    result = buffer.getChannelData(0);
+    const channels: Float32Array[] = [];
+    for (let c = 0; c < numChannels; c++) {
+      channels.push(buffer.getChannelData(c));
+    }
+    result = interleaveChannels(channels);
   }
 
-  return encodeWAV(result, format, sampleRate, outChannels, bitDepth);
+  return encodeWAV(result, format, sampleRate, numChannels, bitDepth);
 }
 
 function encodeWAV(
@@ -79,17 +74,16 @@ function encodeWAV(
   return buffer;
 }
 
-function interleave(inputL: Float32Array, inputR: Float32Array): Float32Array {
-  const length = inputL.length + inputR.length;
-  const result = new Float32Array(length);
+function interleaveChannels(channels: Float32Array[]): Float32Array {
+  const numChannels = channels.length;
+  const frameCount = channels[0]?.length ?? 0;
+  const result = new Float32Array(frameCount * numChannels);
 
   let index = 0;
-  let inputIndex = 0;
-
-  while (index < length) {
-    result[index++] = inputL[inputIndex];
-    result[index++] = inputR[inputIndex];
-    inputIndex++;
+  for (let i = 0; i < frameCount; i++) {
+    for (let c = 0; c < numChannels; c++) {
+      result[index++] = channels[c][i];
+    }
   }
   return result;
 }
