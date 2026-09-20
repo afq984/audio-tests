@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, 'fixtures', 'synthetic-2s.aecdump.binpb');
 
-/** Reads every track's wavesurfer clock straight off the component. */
+/** Reads every track's transport clock straight off the component. */
 async function currentTimes(page: import('@playwright/test').Page) {
   return page.evaluate(() => {
     const el = document.querySelector('aecdump-viewer') as any;
@@ -63,6 +63,38 @@ test.describe('the dump decides the tracks', () => {
     expect(muted).toEqual([false, true, true]);
     expect((await currentTimes(page)).times).toEqual(before);
   });
+
+  test('renders event-time layout, diagnostic lanes, and controls without errors', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    const pageErrors: Error[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(err));
+
+    await expect(page.locator('#lateness-input')).toBeVisible();
+    await expect(page.locator('#render-offset-input')).toBeVisible();
+    await expect(page.locator('#seek-resolution')).toBeVisible();
+    await expect(page.locator('#markers-lane')).toBeVisible();
+    await expect(page.locator('#drift-lane')).toBeVisible();
+    await expect(page.locator('#series-lane')).toBeVisible();
+
+    // Verify marker detail panel shows INIT details
+    await expect(page.locator('#marker-detail-panel')).toContainText('Init #1');
+
+    // Verify toggleGain toggles between Fit and zoomed multiplier
+    const zoomBtn = page.locator('#zoom-init1-input');
+    await expect(zoomBtn).toHaveText('Fit');
+    await zoomBtn.click();
+    await expect(zoomBtn).not.toHaveText('Fit');
+    await zoomBtn.click();
+    await expect(zoomBtn).toHaveText('Fit');
+
+    expect(consoleErrors).toEqual([]);
+    expect(pageErrors).toEqual([]);
+  });
 });
 
 test.describe('synchronized seeking', () => {
@@ -83,10 +115,6 @@ test.describe('synchronized seeking', () => {
   });
 
   test('dragging a waveform moves every track to the dragged position', async ({ page }) => {
-    // wavesurfer emits 'interaction' as soon as the drag starts but debounces
-    // the actual seek by 200ms while paused, so a handler that reads
-    // getCurrentTime() sees the pre-drag position and leaves the other tracks
-    // behind. The event argument carries the correct target time.
     const box = await page.locator('#waveform-init1-reverse').boundingBox();
     expect(box).not.toBeNull();
     if (!box) return;
@@ -99,8 +127,6 @@ test.describe('synchronized seeking', () => {
     });
     await page.mouse.up();
 
-    // Wait past the drag-to-seek debounce so the dragged track has settled too.
-    await page.waitForTimeout(600);
     const { times, names, duration } = await currentTimes(page);
 
     const target = duration * targetFraction;
@@ -119,7 +145,6 @@ test.describe('synchronized seeking', () => {
 
     const targetFraction = 0.4;
     await page.mouse.click(box.x + box.width * targetFraction, box.y + box.height / 2);
-    await page.waitForTimeout(300);
 
     const { times, names, duration } = await currentTimes(page);
     const target = duration * targetFraction;

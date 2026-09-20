@@ -1,9 +1,44 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
-import WaveSurfer from 'wavesurfer.js';
 import { parseDump } from './parse-dump.js';
-import { DumpTrack, ParsedDump, allTracks } from './dump-model.js';
+import {
+  DumpTrack,
+  FRAMES_PER_SECOND,
+  FRAME_MS,
+  Marker,
+  ParsedDump,
+  allTracks,
+  dumpDuration,
+} from './dump-model.js';
+import {
+  DEFAULT_ALLOWED_LATENESS_FRAMES,
+  EventStream,
+  EventTimeLayout,
+  SeekResolution,
+  eventFramesToSeconds,
+  layOutEventTime,
+  runsFor,
+  toEventFrame,
+  toNativeFrame,
+} from './event-time.js';
+import {
+  IDENTITY_TRANSFORM,
+  TrackTransform,
+  makeTransform,
+  toDisplayTime,
+  toEventFrame as displayToEventFrame,
+} from './timeline.js';
+import { DriftAnalysis, analyzeDrift } from './drift-analysis.js';
 import { audioBufferToWav } from './wav-helper.js';
+
+/**
+ * Facade exposing per-track transport state for deterministic inspection and E2E tests.
+ */
+export interface TrackTransportFacade {
+  getCurrentTime: () => number;
+  getDuration: () => number;
+  getMuted: () => boolean;
+}
 
 /**
  * One row in the viewer.
@@ -13,8 +48,7 @@ import { audioBufferToWav } from './wav-helper.js';
  * files, and a stream that never carried data has no row at all.
  */
 interface UiTrack {
-  /** Stable identity from the parser: `init1:reverse`. Not the display name,
-   *  which can collide when two INITs are separated by no capture frames. */
+  /** Stable identity from the parser: `init1:reverse`. */
   id: string;
   /** unpack-style name, e.g. `reverse1200.wav`. */
   name: string;
@@ -25,15 +59,23 @@ interface UiTrack {
   peak: number;
   /**
    * Vertical scale for drawing only; playback and export are untouched.
-   *
-   * 1 draws at absolute scale, so heights are comparable between tracks. One
-   * fixed scale cannot serve both jobs: a capture stream 25dB below the playout
-   * reference is a flat line at absolute scale, and scaling every track to its
-   * own peak makes a near-silent one look identical to a loud one. So the
-   * default is honest and the zoom is per track, as in Audacity.
+   * 1 draws at honest [-1, 1] scale.
    */
   gain: number;
-  ws: WaveSurfer | null;
+  /** Whether vertical fit zoom (1 / peak) is currently active. */
+  zoomed: boolean;
+  /** Decoded WebAudio buffer for playback and WAV export. */
+  audioBuffer: AudioBuffer;
+  /** Current position on the track's own native frame axis. */
+  currentNativeFrame: number;
+  /** Native position relative to track start, in seconds [0, source.duration]. */
+  currentTime: number;
+  /** Native frame when playback started. */
+  playStartNativeFrame: number;
+  /** True unless this track is the single audible track. */
+  muted: boolean;
+  /** Compatibility facade for inspecting per-track clock, duration, and mute state. */
+  ws: TrackTransportFacade;
   url: string | null;
 }
 
@@ -64,17 +106,27 @@ export class AecDumpViewer extends LitElement {
 
   @state() private tracks: UiTrack[] = [];
   @state() private warnings: string[] = [];
-  /**
-   * The one track connected to audio output.
-   *
-   * Playing every track at once is a DAW feature with no use here -- the
-   * streams are different points in one signal chain, not parts of a mix, and
-   * hearing them summed tells you nothing. Seeking still moves every track.
-   */
   @state() private audibleTrackId: string | null = null;
 
+  @state() private allowedLatenessFrames: number = DEFAULT_ALLOWED_LATENESS_FRAMES;
+  @state() private renderOffsetMs = 0;
+  @state() private seekResolution: SeekResolution | null = null;
+  @state() private selectedMarker: Marker | null = null;
+
+  private parsedDump: ParsedDump | null = null;
+  private layout: EventTimeLayout | null = null;
+  private driftAnalyses: DriftAnalysis[] = [];
+  private renderTransform: TrackTransform = IDENTITY_TRANSFORM;
+  private displayStart = 0;
+  private displayEnd = 0;
+
   private audioCtx: AudioContext | null = null;
-  private syncSeeking = false;
+  private activeSourceNode: AudioBufferSourceNode | null = null;
+  private activeGainNode: GainNode | null = null;
+  private playStartCtxTime = 0;
+  private rafId: number | null = null;
+  private draggingTimeline: EventStream | null = null;
+  private draggingContainer: HTMLElement | null = null;
 
   static override styles = css`
     :host {
@@ -87,13 +139,13 @@ export class AecDumpViewer extends LitElement {
     }
 
     header {
-      margin-bottom: 30px;
+      margin-bottom: 24px;
       border-bottom: 1px solid #eee;
-      padding-bottom: 20px;
+      padding-bottom: 16px;
     }
 
     h1 {
-      margin: 0 0 10px 0;
+      margin: 0 0 8px 0;
       font-size: 24px;
       color: #1a73e8;
     }
@@ -107,7 +159,7 @@ export class AecDumpViewer extends LitElement {
     .dropzone {
       border: 2px dashed #ccc;
       border-radius: 8px;
-      padding: 40px 20px;
+      padding: 32px 20px;
       text-align: center;
       background: #fafafa;
       cursor: pointer;
@@ -115,7 +167,8 @@ export class AecDumpViewer extends LitElement {
       margin-bottom: 20px;
     }
 
-    .dropzone:hover, .dropzone.dragover {
+    .dropzone:hover,
+    .dropzone.dragover {
       border-color: #1a73e8;
       background: #f1f3f4;
     }
@@ -141,16 +194,56 @@ export class AecDumpViewer extends LitElement {
 
     .controls {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 15px;
-      margin-bottom: 25px;
+      gap: 14px;
+      margin-bottom: 20px;
       background: #f8f9fa;
-      padding: 15px;
+      padding: 12px 16px;
       border-radius: 8px;
       border: 1px solid #e0e0e0;
     }
 
-    button {
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: #3c4043;
+    }
+
+    .control-group input[type='number'] {
+      width: 68px;
+      padding: 4px 6px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: monospace;
+    }
+
+    .control-hint {
+      color: #5f6368;
+      font-family: monospace;
+      font-size: 12px;
+    }
+
+    .seek-badge {
+      font-family: monospace;
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: #e8eaed;
+      color: #3c4043;
+    }
+
+    .seek-badge.warn {
+      background: #fef7e0;
+      color: #b06000;
+      border: 1px solid #fdd663;
+    }
+
+    button,
+    a.button {
       background: #1a73e8;
       color: white;
       border: none;
@@ -160,9 +253,13 @@ export class AecDumpViewer extends LitElement {
       cursor: pointer;
       transition: background 0.2s;
       font-size: 14px;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
     }
 
-    button:hover {
+    button:hover,
+    a.button:hover {
       background: #1557b0;
     }
 
@@ -171,22 +268,16 @@ export class AecDumpViewer extends LitElement {
       cursor: not-allowed;
     }
 
-    button.secondary {
+    button.secondary,
+    a.button.secondary {
       background: #f1f3f4;
       color: #3c4043;
       border: 1px solid #dadce0;
     }
 
-    button.secondary:hover {
+    button.secondary:hover,
+    a.button.secondary:hover {
       background: #e8eaed;
-    }
-
-    button.active {
-      background: #d93025;
-    }
-
-    button.active:hover {
-      background: #b0251a;
     }
 
     .time-display {
@@ -199,27 +290,32 @@ export class AecDumpViewer extends LitElement {
     .tracks-container {
       display: flex;
       flex-direction: column;
-      gap: 20px;
+      gap: 16px;
+      margin-bottom: 20px;
     }
 
-    .track-card {
+    .track-card,
+    .diagnostic-card {
       border: 1px solid #dadce0;
       border-radius: 8px;
       background: white;
       overflow: hidden;
-      box-shadow: 0 1px 2px 0 rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);
+      box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.2), 0 1px 3px 1px rgba(60, 64, 67, 0.1);
     }
 
-    .track-header {
+    .track-header,
+    .diagnostic-header {
       background: #f8f9fa;
-      padding: 10px 15px;
+      padding: 8px 14px;
       border-bottom: 1px solid #dadce0;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 15px;
+      gap: 12px;
     }
 
-    .track-title {
+    .track-title,
+    .diagnostic-title {
       font-weight: 600;
       font-size: 14px;
       color: #3c4043;
@@ -232,7 +328,8 @@ export class AecDumpViewer extends LitElement {
       margin-left: auto;
     }
 
-    .track-controls button {
+    .track-controls button,
+    .track-controls a.button {
       padding: 4px 8px;
       font-size: 12px;
     }
@@ -249,10 +346,23 @@ export class AecDumpViewer extends LitElement {
       border-color: #1a73e8;
     }
 
-    .track-meta {
+    .track-meta,
+    .diagnostic-badges {
       font-family: monospace;
       font-size: 12px;
       color: #5f6368;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .badge {
+      background: #e8f0fe;
+      color: #1a73e8;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: monospace;
     }
 
     .warnings {
@@ -265,17 +375,126 @@ export class AecDumpViewer extends LitElement {
       font-size: 13px;
     }
 
-    .track-body {
-      padding: 15px;
+    .track-body,
+    .diagnostic-body {
+      padding: 12px 14px;
       background: #fafafa;
       position: relative;
     }
 
-    .waveform-container {
+    .waveform-container,
+    .chart-container {
       background: white;
-      border: 1px solid #eee;
+      border: 1px solid #e0e0e0;
       border-radius: 4px;
       min-height: 80px;
+      position: relative;
+      cursor: ew-resize;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    .waveform-canvas,
+    .chart-canvas {
+      display: block;
+      width: 100%;
+      height: 80px;
+    }
+
+    .chart-canvas.tall {
+      height: 110px;
+    }
+
+    .diagnostics-container {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .markers-strip {
+      position: relative;
+      height: 32px;
+      background: white;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+
+    .marker-pin {
+      position: absolute;
+      top: 4px;
+      transform: translateX(-50%);
+      padding: 2px 6px;
+      font-size: 11px;
+      font-family: monospace;
+      border-radius: 3px;
+      cursor: pointer;
+      white-space: nowrap;
+      border: 1px solid #1a73e8;
+      background: #e8f0fe;
+      color: #1a73e8;
+      z-index: 2;
+    }
+
+    .marker-pin.active {
+      background: #1a73e8;
+      color: white;
+      z-index: 3;
+    }
+
+    .marker-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    .marker-detail {
+      background: white;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-family: monospace;
+    }
+
+    .marker-detail table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 4px;
+    }
+
+    .marker-detail td {
+      padding: 2px 8px 2px 0;
+      border-bottom: 1px solid #f1f3f4;
+    }
+
+    .marker-detail td.key {
+      color: #5f6368;
+      width: 220px;
+    }
+
+    .legend {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      color: #5f6368;
+      margin-left: auto;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      display: inline-block;
     }
   `;
 
@@ -285,47 +504,107 @@ export class AecDumpViewer extends LitElement {
     return html`
       <header>
         <h1>AECDump Web Viewer</h1>
-        <p class="description">In-browser replacement for unpack_aecdump: decodes a dump to its streams, names them the way unpack does, and plays them.</p>
+        <p class="description">
+          In-browser replacement for unpack_aecdump: decodes a dump to its streams, names them the
+          way unpack does, and lays them out on a shared event-time axis.
+        </p>
       </header>
 
-      <div 
-        class="dropzone" 
+      <div
+        class="dropzone"
         @dragover=${this.onDragOver}
         @dragleave=${this.onDragLeave}
         @drop=${this.onDrop}
         @click=${this.triggerFileSelect}
       >
-        <p>${this.loading ? 'Parsing dump...' : 'Drag & drop an aecdump/protobuf file here, or click to select'}</p>
-        <input type="file" id="fileInput" accept=".pb,.aecdump,.aecdump.binpb,.binpb,*" @change=${this.onFileSelected}>
+        <p>
+          ${this.loading
+            ? 'Parsing dump...'
+            : 'Drag & drop an aecdump/protobuf file here, or click to select'}
+        </p>
+        <input
+          type="file"
+          id="fileInput"
+          accept=".pb,.aecdump,.aecdump.binpb,.binpb,*"
+          @change=${this.onFileSelected}
+        />
       </div>
 
       ${this.loadingStatus ? html`<div class="status">${this.loadingStatus}</div>` : ''}
+      ${this.warnings.length > 0
+        ? html`
+            <ul class="warnings" id="warnings">
+              ${this.warnings.map((w) => html`<li>${w}</li>`)}
+            </ul>
+          `
+        : ''}
+      ${hasTracks
+        ? html`
+            <div class="controls">
+              <button id="play-pause-btn" @click=${this.togglePlay}>
+                ${this.isPlaying ? 'Pause' : 'Play'}
+              </button>
+              <button id="stop-btn" class="secondary" @click=${this.stopAll}>Stop</button>
 
-      ${this.warnings.length > 0 ? html`
-        <ul class="warnings" id="warnings">
-          ${this.warnings.map(w => html`<li>${w}</li>`)}
-        </ul>
-      ` : ''}
+              <label class="control-group" for="lateness-input">
+                <span>Lateness tolerance:</span>
+                <input
+                  id="lateness-input"
+                  type="number"
+                  min="0"
+                  max="1000"
+                  step="1"
+                  .value=${String(this.allowedLatenessFrames)}
+                  @input=${this.onLatenessInput}
+                />
+                <span class="control-hint">frames (${this.allowedLatenessFrames * FRAME_MS} ms)</span>
+              </label>
 
-      ${hasTracks ? html`
-        <div class="controls">
-          <button @click=${this.togglePlay}>${this.isPlaying ? 'Pause' : 'Play'}</button>
-          <button class="secondary" @click=${this.stopAll}>Stop</button>
-          
-          <div class="time-display">
-            ${this.formatTime(this.currentTime)} / ${this.formatTime(this.duration)}
-          </div>
-        </div>
+              <label class="control-group" for="render-offset-input">
+                <span>Render offset:</span>
+                <input
+                  id="render-offset-input"
+                  type="number"
+                  min="-5000"
+                  max="5000"
+                  step="10"
+                  .value=${String(this.renderOffsetMs)}
+                  @input=${this.onRenderOffsetInput}
+                />
+                <span class="control-hint">ms</span>
+              </label>
 
-        <div class="tracks-container">
-          ${this.tracks.map(track => this.renderTrackCard(track))}
-        </div>
-      ` : ''}
+              <span
+                id="seek-resolution"
+                class="seek-badge ${this.seekResolution && this.seekResolution !== 'exact'
+                  ? 'warn'
+                  : ''}"
+              >
+                ${this.seekResolution ? `seek: ${this.seekResolution}` : 'seek: exact'}
+              </span>
+
+              <div class="time-display">
+                ${this.formatTime(this.currentTime)} / ${this.formatTime(this.duration)}
+              </div>
+            </div>
+
+            <div class="tracks-container">
+              ${this.tracks.map((track) => this.renderTrackCard(track))}
+            </div>
+
+            <div class="diagnostics-container">
+              ${this.renderMarkersLane()} ${this.renderDriftLane()} ${this.renderSeriesLane()}
+            </div>
+          `
+        : ''}
     `;
   }
 
   private renderTrackCard(track: UiTrack) {
     const audible = track.id === this.audibleTrackId;
+    const zoomLabel = track.zoomed
+      ? `${track.gain >= 10 ? track.gain.toFixed(0) : track.gain.toFixed(1)}\u00d7`
+      : 'Fit';
     return html`
       <div class="track-card">
         <div class="track-header">
@@ -334,18 +613,17 @@ export class AecDumpViewer extends LitElement {
           <div class="track-controls">
             <span class="track-meta">
               ${track.source.sampleRate} Hz
-              ${track.source.channels > 1 ? html`&times;${track.source.channels}` : ''}
-              &middot; ${track.source.duration.toFixed(2)}s
-              &middot; ${track.source.timeline}
-              &middot; peak ${formatDbfs(track.peak)}
+              ${track.source.channels > 1 ? html`&times;${track.source.channels}` : ''} &middot;
+              ${track.source.duration.toFixed(2)}s &middot; ${track.source.timeline} &middot; peak
+              ${formatDbfs(track.peak)}
             </span>
             <button
-              class="secondary zoom ${track.gain > 1 ? 'active' : ''}"
+              class="secondary zoom ${track.zoomed ? 'active' : ''}"
               id="zoom-${track.domId}"
               title="Vertical zoom. Drawing only -- playback is unchanged."
               @click=${() => this.toggleGain(track.id)}
             >
-              ${track.gain > 1 ? `${track.gain.toFixed(0)}\u00d7` : 'Fit'}
+              ${zoomLabel}
             </button>
             <button
               class="secondary listen ${audible ? 'active' : ''}"
@@ -354,13 +632,184 @@ export class AecDumpViewer extends LitElement {
             >
               ${audible ? 'Listening' : 'Listen'}
             </button>
+            <a
+              class="button secondary download-wav"
+              download=${track.name}
+              href=${track.url ?? '#'}
+            >
+              WAV
+            </a>
           </div>
         </div>
         <div class="track-body">
-          <div class="waveform-container" id="waveform-${track.domId}"></div>
+          <div
+            class="waveform-container"
+            id="waveform-${track.domId}"
+            @pointerdown=${(e: PointerEvent) =>
+              this.onTimelinePointerDown(e, track.source.timeline)}
+          >
+            <canvas class="waveform-canvas" id="canvas-${track.domId}"></canvas>
+          </div>
         </div>
       </div>
     `;
+  }
+
+  private renderMarkersLane() {
+    const markers = this.parsedDump?.markers ?? [];
+    const span = Math.max(0.001, this.displayEnd - this.displayStart);
+
+    return html`
+      <div class="diagnostic-card" id="markers-lane">
+        <div class="diagnostic-header">
+          <span class="diagnostic-title">Markers &amp; Configuration Events</span>
+          <div class="diagnostic-badges">
+            <span class="badge">${markers.length} event${markers.length === 1 ? '' : 's'}</span>
+          </div>
+        </div>
+        <div class="diagnostic-body">
+          <div class="markers-strip">
+            ${markers.map((marker) => {
+              const evFrame =
+                this.layout !== null
+                  ? (toEventFrame(this.layout, 'capture', marker.frame) ?? marker.frame)
+                  : marker.frame;
+              const dispSec = toDisplayTime(IDENTITY_TRANSFORM, evFrame);
+              const pct = Math.max(2, Math.min(98, ((dispSec - this.displayStart) / span) * 100));
+              const isSelected = this.selectedMarker === marker;
+              return html`
+                <button
+                  class="marker-pin ${isSelected ? 'active' : ''}"
+                  style="left: ${pct}%"
+                  title="${marker.label} @ frame ${marker.frame}"
+                  @click=${() => this.selectMarker(marker)}
+                >
+                  ${marker.label}
+                </button>
+              `;
+            })}
+          </div>
+
+          ${this.selectedMarker
+            ? html`
+                <div class="marker-detail" id="marker-detail-panel">
+                  <div>
+                    <strong>${this.selectedMarker.label}</strong>
+                    (${this.selectedMarker.kind}, frame ${this.selectedMarker.frame},
+                    ${this.selectedMarker.time.toFixed(2)}s)
+                  </div>
+                  ${this.selectedMarker.detail.length > 0
+                    ? html`
+                        <table>
+                          <tbody>
+                            ${this.selectedMarker.detail.map(
+                              ([k, v]) => html`
+                                <tr>
+                                  <td class="key">${k}</td>
+                                  <td class="val">${v}</td>
+                                </tr>
+                              `
+                            )}
+                          </tbody>
+                        </table>
+                      `
+                    : ''}
+                </div>
+              `
+            : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  private renderDriftLane() {
+    const totalLeading = this.driftAnalyses.reduce((s, a) => s + a.leadingRenderFrames, 0);
+    const totalTrailing = this.driftAnalyses.reduce((s, a) => s + a.trailingRenderFrames, 0);
+    const gapCount = this.layout?.gaps.length ?? 0;
+
+    return html`
+      <div class="diagnostic-card" id="drift-lane">
+        <div class="diagnostic-header">
+          <span class="diagnostic-title">Call-Order Drift &amp; Delay</span>
+          <div class="diagnostic-badges">
+            <span class="badge" id="badge-leading-render">leadingRenderFrames: ${totalLeading}</span>
+            <span class="badge" id="badge-trailing-render">
+              trailingRenderFrames: ${totalTrailing}
+            </span>
+            <span class="badge" id="badge-gaps">gaps: ${gapCount}</span>
+          </div>
+          <div class="legend">
+            <span class="legend-item">
+              <span class="legend-swatch" style="background: #d93025"></span>
+              Call-order drift (ms)
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch" style="background: #1a73e8"></span>
+              Stream.delay (ms)
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch" style="background: #188038"></span>
+              Stream.drift
+            </span>
+          </div>
+        </div>
+        <div class="diagnostic-body">
+          <div
+            class="chart-container"
+            id="drift-chart-container"
+            @pointerdown=${(e: PointerEvent) => this.onTimelinePointerDown(e, 'capture')}
+          >
+            <canvas class="chart-canvas tall" id="canvas-drift"></canvas>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderSeriesLane() {
+    const series = this.parsedDump?.series;
+    const hasVolume = series?.appliedInputVolume !== null && series?.appliedInputVolume !== undefined;
+    const hasKeypress = series?.keypress !== null && series?.keypress !== undefined;
+
+    return html`
+      <div class="diagnostic-card" id="series-lane">
+        <div class="diagnostic-header">
+          <span class="diagnostic-title">Capture Telemetry (Applied Input Volume &amp; Keypress)</span>
+          <div class="legend">
+            <span class="legend-item">
+              <span class="legend-swatch" style="background: #9334e6"></span>
+              Applied Input Volume
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch" style="background: #f29900"></span>
+              Keypress
+            </span>
+          </div>
+        </div>
+        <div class="diagnostic-body">
+          <div
+            class="chart-container"
+            id="series-chart-container"
+            @pointerdown=${(e: PointerEvent) => this.onTimelinePointerDown(e, 'capture')}
+          >
+            <canvas class="chart-canvas" id="canvas-series"></canvas>
+          </div>
+          ${!hasVolume && !hasKeypress
+            ? html`<div class="control-hint" style="margin-top: 6px;">
+                No applied_input_volume or keypress series recorded in this dump.
+              </div>`
+            : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  private selectMarker(marker: Marker) {
+    this.selectedMarker = marker;
+    if (this.layout) {
+      const evFrame = toEventFrame(this.layout, 'capture', marker.frame) ?? marker.frame;
+      this.seekToEventFrame(evFrame);
+    }
   }
 
   // File selection & drag-drop handling
@@ -393,21 +842,21 @@ export class AecDumpViewer extends LitElement {
     this.loading = true;
     this.loadingStatus = `Loading file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...`;
     this.stopAll();
-    this.destroyWaveSurfers();
+    this.cleanupTracks();
     this.warnings = [];
 
     try {
       const arrayBuffer = await file.arrayBuffer();
       this.loadingStatus = 'Parsing AECDump protobuf data...';
-      
-      // Small delay to allow UI to update
-      await new Promise(resolve => setTimeout(resolve, 50));
-      
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
       const parsed = parseDump(arrayBuffer);
+      this.parsedDump = parsed;
       this.warnings = parsed.warnings;
-      
-      this.loadingStatus = 'Decoding audio and preparing tracks...';
-      await new Promise(resolve => setTimeout(resolve, 50));
+
+      this.loadingStatus = 'Decoding audio and preparing event-time layout...';
+      await new Promise((resolve) => setTimeout(resolve, 20));
 
       await this.initializeTracks(parsed);
       this.loadingStatus = 'AECDump loaded successfully!';
@@ -419,43 +868,70 @@ export class AecDumpViewer extends LitElement {
     }
   }
 
+  private recomputeLayoutAndBounds() {
+    if (!this.parsedDump) return;
+    this.layout = layOutEventTime(this.parsedDump.callOrder, this.allowedLatenessFrames);
+    this.driftAnalyses = analyzeDrift(this.parsedDump.callOrder);
+    this.renderTransform = makeTransform(this.renderOffsetMs / 1000);
+
+    const layoutSec = eventFramesToSeconds(this.layout.extentFrames);
+    const shiftedSec = layoutSec + this.renderTransform.offsetSeconds;
+    const rawDumpDur = dumpDuration(this.parsedDump);
+
+    this.displayStart = Math.min(0, this.renderTransform.offsetSeconds);
+    this.displayEnd = Math.max(layoutSec, shiftedSec, rawDumpDur, 0.01);
+    this.duration = this.displayEnd - this.displayStart;
+  }
+
   /** Builds one row per track the dump actually contains. */
   private async initializeTracks(dump: ParsedDump) {
     if (!this.audioCtx) {
       this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
 
-    const wavUrl = (track: DumpTrack): string | null => {
-      if (track.channelData.length === 0 || track.channelData[0].length === 0) return null;
-      const buffer = this.audioCtx!.createBuffer(
-        track.channels,
-        track.channelData[0].length,
-        track.sampleRate
+    this.recomputeLayoutAndBounds();
+    this.selectedMarker = dump.markers[0] ?? null;
+    this.seekResolution = 'exact';
+
+    const buildTrack = (source: DumpTrack): UiTrack | null => {
+      if (source.channelData.length === 0 || source.channelData[0].length === 0) return null;
+      const audioBuffer = this.audioCtx!.createBuffer(
+        source.channels,
+        source.channelData[0].length,
+        source.sampleRate
       );
-      for (let c = 0; c < track.channels; c++) {
-        buffer.copyToChannel(track.channelData[c] as any, c);
+      for (let c = 0; c < source.channels; c++) {
+        audioBuffer.copyToChannel(new Float32Array(source.channelData[c]), c);
       }
-      const blob = new Blob([audioBufferToWav(buffer)], { type: 'audio/wav' });
-      return URL.createObjectURL(blob);
+      const blob = new Blob([audioBufferToWav(audioBuffer)], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+
+      const uiTrack: UiTrack = {
+        id: source.id,
+        name: source.name,
+        domId: source.id.replace(/[^a-zA-Z0-9_-]/g, '-'),
+        source,
+        peak: peakOf(source),
+        gain: 1,
+        zoomed: false,
+        audioBuffer,
+        currentNativeFrame: source.startFrame,
+        currentTime: 0,
+        playStartNativeFrame: source.startFrame,
+        muted: true,
+        ws: {
+          getCurrentTime: () => uiTrack.currentTime,
+          getDuration: () => uiTrack.source.duration,
+          getMuted: () => uiTrack.muted,
+        },
+        url,
+      };
+      return uiTrack;
     };
 
     this.tracks = allTracks(dump).flatMap((source) => {
-      const url = wavUrl(source);
-      if (!url) return [];
-      return [
-        {
-          id: source.id,
-          name: source.name,
-          // The parser's id carries a colon, which is not usable unescaped in
-          // a CSS selector.
-          domId: source.id.replace(/[^a-zA-Z0-9_-]/g, '-'),
-          source,
-          peak: peakOf(source),
-          gain: 1,
-          ws: null,
-          url,
-        },
-      ];
+      const built = buildTrack(source);
+      return built ? [built] : [];
     });
 
     // Default to the microphone input: it is what a user opening a dump is
@@ -463,75 +939,623 @@ export class AecDumpViewer extends LitElement {
     const preferred =
       this.tracks.find((t) => t.source.kind === 'input') ?? this.tracks[0] ?? null;
     this.audibleTrackId = preferred ? preferred.id : null;
+    for (const track of this.tracks) {
+      track.muted = track.id !== this.audibleTrackId;
+    }
 
     this.requestUpdate();
     await this.updateComplete;
 
-    this.initWaveSurfers();
+    this.drawAllCanvases();
   }
 
-  private initWaveSurfers() {
-    const wsOptions = {
-      height: 80,
-      waveColor: '#a8c7fa',
-      progressColor: '#1a73e8',
-      cursorColor: '#3c4043',
-      cursorWidth: 2,
-      dragToSeek: true,
-      // Not normalized. Each track would otherwise be scaled to its own peak,
-      // so a capture stream 25dB below the playout reference draws exactly as
-      // tall as it does -- and a user who presses play and hears almost
-      // nothing has no way to tell a quiet dump from a broken decode. Levels
-      // across tracks are one of the things this view is for.
-      normalize: false,
+  private onLatenessInput(e: Event) {
+    const val = Number((e.target as HTMLInputElement).value);
+    if (!Number.isFinite(val) || val < 0) return;
+    this.allowedLatenessFrames = Math.floor(val);
+    this.recomputeLayoutAndBounds();
+    this.drawAllCanvases();
+  }
+
+  private onRenderOffsetInput(e: Event) {
+    const val = Number((e.target as HTMLInputElement).value);
+    if (!Number.isFinite(val)) return;
+    this.renderOffsetMs = val;
+    this.recomputeLayoutAndBounds();
+    this.drawAllCanvases();
+  }
+
+  private onTimelinePointerDown(e: PointerEvent, timeline: EventStream) {
+    const container = e.currentTarget as HTMLElement;
+    if (!container) return;
+    container.setPointerCapture?.(e.pointerId);
+    this.draggingTimeline = timeline;
+    this.draggingContainer = container;
+
+    this.seekAtPointer(e.clientX, container, timeline);
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (!this.draggingContainer || !this.draggingTimeline) return;
+      this.seekAtPointer(moveEvent.clientX, this.draggingContainer, this.draggingTimeline);
     };
 
+    const onUp = (upEvent: PointerEvent) => {
+      if (this.draggingContainer && this.draggingTimeline) {
+        this.seekAtPointer(upEvent.clientX, this.draggingContainer, this.draggingTimeline);
+      }
+      this.draggingContainer = null;
+      this.draggingTimeline = null;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
+
+  private seekAtPointer(clientX: number, container: HTMLElement, timeline: EventStream) {
+    if (!this.layout) return;
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const fraction = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const displaySec = this.displayStart + fraction * (this.displayEnd - this.displayStart);
+    const transform = timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
+    const eventFrame = Math.max(0, displayToEventFrame(transform, displaySec));
+    this.seekToEventFrame(eventFrame);
+  }
+
+  private seekToEventFrame(eventFrame: number) {
+    if (!this.layout) return;
+
+    let primaryResolution: SeekResolution = 'exact';
     for (const track of this.tracks) {
-      const container = this.shadowRoot?.getElementById(`waveform-${track.domId}`);
-      if (!container || !track.url) continue;
+      const result = toNativeFrame(this.layout, track.source.timeline, eventFrame);
+      const trackFrames = Math.round(track.source.duration * FRAMES_PER_SECOND);
+      const minNative = track.source.startFrame;
+      const maxNative = track.source.startFrame + trackFrames;
+      const clampedNative = Math.max(minNative, Math.min(maxNative, result.nativeFrame));
 
-      const ws = WaveSurfer.create({ ...wsOptions, container, url: track.url });
-      track.ws = ws;
-      ws.setMuted(track.id !== this.audibleTrackId);
+      track.currentNativeFrame = clampedNative;
+      track.currentTime = Math.max(
+        0,
+        Math.min(track.source.duration, (clampedNative - minNative) / FRAMES_PER_SECOND)
+      );
 
-      // The longest track drives the transport clock. Every track is on its own
-      // native clock and they need not be the same length, so taking the first
-      // one would stop the display short of a longer stream.
-      ws.on('ready', (duration) => {
-        this.duration = Math.max(this.duration, duration);
-      });
-      // Bound for every track, not just the audible one: output moves between
-      // tracks and a handler attached only at load would leave the clock frozen
-      // and the Play button stuck after a switch.
-      ws.on('timeupdate', (time) => {
-        if (track.id === this.audibleTrackId) this.currentTime = time;
-      });
-      ws.on('finish', () => {
-        if (track.id === this.audibleTrackId) this.isPlaying = false;
-      });
+      if (track.id === this.audibleTrackId) {
+        primaryResolution = result.resolution;
+      }
+    }
 
-      // Synchronized Seeking
-      // Use the time carried by the event rather than ws.getCurrentTime():
-      // on the drag path wavesurfer emits 'interaction' immediately but
-      // debounces the actual seek, so getCurrentTime() is still the old
-      // position and the other tracks would sync to a stale point.
-      ws.on('interaction', (newTime) => {
-        if (this.syncSeeking) return;
-        this.syncSeeking = true;
-        for (const other of this.tracks) {
-          if (other.id !== track.id && other.ws) other.ws.setTime(newTime);
+    this.seekResolution = primaryResolution;
+    const audible = this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
+    const audibleTransform =
+      audible?.source.timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
+    this.currentTime = Math.max(
+      0,
+      Math.min(this.duration, toDisplayTime(audibleTransform, eventFrame) - this.displayStart)
+    );
+
+    if (this.isPlaying) {
+      this.startWebAudioFromCurrentPositions();
+    }
+
+    this.drawAllCanvases();
+  }
+
+  private drawAllCanvases() {
+    for (const track of this.tracks) {
+      this.drawTrackCanvas(track);
+    }
+    this.drawDriftCanvas();
+    this.drawSeriesCanvas();
+  }
+
+  private prepareCanvas(canvasId: string, heightCss: number): {
+    ctx: CanvasRenderingContext2D;
+    width: number;
+    height: number;
+  } | null {
+    const canvas = this.shadowRoot?.getElementById(canvasId) as HTMLCanvasElement | null;
+    if (!canvas) return null;
+    const parent = canvas.parentElement;
+    const width = Math.max(320, parent?.clientWidth || 800);
+    const height = heightCss;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    return { ctx, width, height };
+  }
+
+  private timeToX(displaySec: number, width: number): number {
+    const span = Math.max(0.001, this.displayEnd - this.displayStart);
+    return ((displaySec - this.displayStart) / span) * width;
+  }
+
+  private drawTrackCanvas(track: UiTrack) {
+    if (!this.layout) return;
+    const prepared = this.prepareCanvas(`canvas-${track.domId}`, 80);
+    if (!prepared) return;
+    const { ctx, width, height } = prepared;
+    const midY = height / 2;
+
+    const transform =
+      track.source.timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
+
+    // Zero baseline
+    ctx.strokeStyle = '#eceff1';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, midY);
+    ctx.lineTo(width, midY);
+    ctx.stroke();
+
+    // 1. Draw structural EventTimeGaps on this lane
+    for (const gap of this.layout.gaps) {
+      if (gap.stream !== track.source.timeline) continue;
+      const x0 = this.timeToX(toDisplayTime(transform, gap.eventStartFrame), width);
+      const x1 = this.timeToX(toDisplayTime(transform, gap.eventEndFrame), width);
+      const gx = Math.max(0, Math.min(width, x0));
+      const gw = Math.max(2, Math.min(width - gx, x1 - x0));
+
+      ctx.fillStyle = 'rgba(217, 48, 37, 0.10)';
+      ctx.fillRect(gx, 0, gw, height);
+
+      // Diagonal hatching
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(gx, 0, gw, height);
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(217, 48, 37, 0.28)';
+      ctx.lineWidth = 1;
+      for (let h = -height; h < gw + height; h += 8) {
+        ctx.beginPath();
+        ctx.moveTo(gx + h, 0);
+        ctx.lineTo(gx + h - height, height);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      if (gw >= 36) {
+        ctx.fillStyle = '#b0251a';
+        ctx.font = '10px monospace';
+        ctx.fillText(`gap ${gap.observedLagFrames * FRAME_MS}ms`, gx + 4, 12);
+      }
+    }
+
+    // 2. Draw waveform runs positioned on the shared display axis
+    const trackFrameCount = Math.round(track.source.duration * FRAMES_PER_SECOND);
+    const trackStartFrame = track.source.startFrame;
+    const trackEndFrame = trackStartFrame + trackFrameCount;
+    const samplesPerFrame = Math.max(1, Math.floor(track.source.sampleRate / FRAMES_PER_SECOND));
+    const channels = track.source.channelData;
+    const totalSamples = channels[0]?.length ?? 0;
+
+    const cursorEventFrame = toEventFrame(
+      this.layout,
+      track.source.timeline,
+      track.currentNativeFrame
+    );
+    const cursorX =
+      cursorEventFrame !== null
+        ? this.timeToX(toDisplayTime(transform, cursorEventFrame), width)
+        : -1;
+
+    const runs = runsFor(this.layout, track.source.timeline);
+    for (const run of runs) {
+      const nativeStart = Math.max(run.nativeStartFrame, trackStartFrame);
+      const nativeEnd = Math.min(run.nativeStartFrame + run.frameCount, trackEndFrame);
+      if (nativeEnd <= nativeStart) continue;
+
+      const eventStart = run.eventStartFrame + (nativeStart - run.nativeStartFrame);
+      const eventEnd = eventStart + (nativeEnd - nativeStart);
+
+      const xStart = this.timeToX(toDisplayTime(transform, eventStart), width);
+      const xEnd = this.timeToX(toDisplayTime(transform, eventEnd), width);
+      const pxStart = Math.max(0, Math.floor(xStart));
+      const pxEnd = Math.min(width - 1, Math.ceil(xEnd));
+      if (pxEnd < pxStart) continue;
+
+      const runSampleStart = (nativeStart - trackStartFrame) * samplesPerFrame;
+      const runSampleEnd = Math.min(totalSamples, (nativeEnd - trackStartFrame) * samplesPerFrame);
+      const runSamples = runSampleEnd - runSampleStart;
+      if (runSamples <= 0) continue;
+
+      const pixelSpan = Math.max(1, xEnd - xStart);
+
+      for (let px = pxStart; px <= pxEnd; px++) {
+        const rel0 = Math.max(0, Math.min(1, (px - xStart) / pixelSpan));
+        const rel1 = Math.max(0, Math.min(1, (px + 1 - xStart) / pixelSpan));
+        const s0 = runSampleStart + Math.floor(rel0 * runSamples);
+        const s1 = Math.max(s0 + 1, runSampleStart + Math.ceil(rel1 * runSamples));
+
+        let minVal = 0;
+        let maxVal = 0;
+        for (let c = 0; c < channels.length; c++) {
+          const ch = channels[c];
+          const limit = Math.min(ch.length, s1);
+          for (let s = s0; s < limit; s++) {
+            const v = ch[s];
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+          }
         }
-        this.syncSeeking = false;
-      });
+
+        const scaledMin = Math.max(-1, Math.min(1, minVal * track.gain));
+        const scaledMax = Math.max(-1, Math.min(1, maxVal * track.gain));
+        const yTop = midY - scaledMax * (midY - 2);
+        const yBot = midY - scaledMin * (midY - 2);
+
+        ctx.fillStyle = px <= cursorX ? '#1a73e8' : '#8ab4f8';
+        ctx.fillRect(px, yTop, 1, Math.max(1.5, yBot - yTop));
+      }
+    }
+
+    // 3. Draw synchronized vertical cursor
+    if (cursorX >= 0 && cursorX <= width) {
+      ctx.strokeStyle = '#202124';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cursorX, 0);
+      ctx.lineTo(cursorX, height);
+      ctx.stroke();
     }
   }
 
-  private destroyWaveSurfers() {
-    for (const track of this.tracks) {
-      if (track.ws) {
-        track.ws.destroy();
-        track.ws = null;
+  private drawDriftCanvas() {
+    if (!this.layout || !this.parsedDump) return;
+    const prepared = this.prepareCanvas('canvas-drift', 110);
+    if (!prepared) return;
+    const { ctx, width, height } = prepared;
+
+    const allDriftPoints = this.driftAnalyses.flatMap((a) => a.points);
+    const delaySeries = this.parsedDump.series.delay;
+    const delayPresent = this.parsedDump.series.delayPresent;
+    const driftSeries = this.parsedDump.series.drift;
+    const driftPresent = this.parsedDump.series.driftPresent;
+
+    let minY = -20;
+    let maxY = 60;
+    for (const p of allDriftPoints) {
+      if (p.driftMs < minY) minY = p.driftMs;
+      if (p.driftMs > maxY) maxY = p.driftMs;
+    }
+    if (delaySeries && delayPresent) {
+      for (let i = 0; i < delaySeries.length; i++) {
+        if (!delayPresent[i]) continue;
+        if (delaySeries[i] < minY) minY = delaySeries[i];
+        if (delaySeries[i] > maxY) maxY = delaySeries[i];
       }
+    }
+    const pad = Math.max(10, (maxY - minY) * 0.1);
+    minY -= pad;
+    maxY += pad;
+
+    const valToY = (v: number) =>
+      height - 10 - ((v - minY) / Math.max(1, maxY - minY)) * (height - 20);
+
+    // Zero line
+    const zeroY = valToY(0);
+    ctx.strokeStyle = '#dadce0';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, zeroY);
+    ctx.lineTo(width, zeroY);
+    ctx.stroke();
+
+    // Plot cumulative call-order drift (ms)
+    if (allDriftPoints.length > 0) {
+      ctx.strokeStyle = '#d93025';
+      ctx.lineWidth = 1.75;
+      ctx.beginPath();
+      let started = false;
+      for (const p of allDriftPoints) {
+        const ev = toEventFrame(this.layout, 'capture', p.captureFrame) ?? p.captureFrame;
+        const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
+        const y = valToY(p.driftMs);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    // Plot Stream.delay (ms)
+    if (delaySeries && delayPresent) {
+      ctx.strokeStyle = '#1a73e8';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let penDown = false;
+      for (let i = 0; i < delaySeries.length; i++) {
+        if (delayPresent[i] !== 1) {
+          penDown = false;
+          continue;
+        }
+        const ev = toEventFrame(this.layout, 'capture', i) ?? i;
+        const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
+        const y = valToY(delaySeries[i]);
+        if (!penDown) {
+          ctx.moveTo(x, y);
+          penDown = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    // Plot Stream.drift if present
+    if (driftSeries && driftPresent) {
+      ctx.strokeStyle = '#188038';
+      ctx.lineWidth = 1.25;
+      ctx.beginPath();
+      let penDown = false;
+      for (let i = 0; i < driftSeries.length; i++) {
+        if (driftPresent[i] !== 1) {
+          penDown = false;
+          continue;
+        }
+        const ev = toEventFrame(this.layout, 'capture', i) ?? i;
+        const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
+        const y = valToY(driftSeries[i]);
+        if (!penDown) {
+          ctx.moveTo(x, y);
+          penDown = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    // Draw shared cursor
+    const cursorX = this.timeToX(this.displayStart + this.currentTime, width);
+    if (cursorX >= 0 && cursorX <= width) {
+      ctx.strokeStyle = '#202124';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cursorX, 0);
+      ctx.lineTo(cursorX, height);
+      ctx.stroke();
+    }
+  }
+
+  private drawSeriesCanvas() {
+    if (!this.layout || !this.parsedDump) return;
+    const prepared = this.prepareCanvas('canvas-series', 80);
+    if (!prepared) return;
+    const { ctx, width, height } = prepared;
+
+    const { appliedInputVolume, appliedInputVolumePresent, keypress, keypressPresent } =
+      this.parsedDump.series;
+
+    if (keypress && keypressPresent) {
+      ctx.fillStyle = 'rgba(242, 153, 0, 0.25)';
+      for (let i = 0; i < keypress.length; i++) {
+        if (keypressPresent[i] === 1 && keypress[i] === 1) {
+          const ev0 = toEventFrame(this.layout, 'capture', i) ?? i;
+          const x0 = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev0), width);
+          const x1 = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev0 + 1), width);
+          ctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
+        }
+      }
+    }
+
+    if (appliedInputVolume && appliedInputVolumePresent) {
+      ctx.strokeStyle = '#9334e6';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let penDown = false;
+      for (let i = 0; i < appliedInputVolume.length; i++) {
+        if (appliedInputVolumePresent[i] !== 1) {
+          penDown = false;
+          continue;
+        }
+        const ev = toEventFrame(this.layout, 'capture', i) ?? i;
+        const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
+        const norm = Math.max(0, Math.min(1, appliedInputVolume[i] / 255));
+        const y = height - 8 - norm * (height - 16);
+        if (!penDown) {
+          ctx.moveTo(x, y);
+          penDown = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    const cursorX = this.timeToX(this.displayStart + this.currentTime, width);
+    if (cursorX >= 0 && cursorX <= width) {
+      ctx.strokeStyle = '#202124';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cursorX, 0);
+      ctx.lineTo(cursorX, height);
+      ctx.stroke();
+    }
+  }
+
+  // WebAudio playback engine
+  private stopWebAudioNodes() {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    if (this.activeSourceNode) {
+      try {
+        this.activeSourceNode.onended = null;
+        this.activeSourceNode.stop();
+      } catch {
+        // Ignore if already stopped
+      }
+      this.activeSourceNode.disconnect();
+      this.activeSourceNode = null;
+    }
+    if (this.activeGainNode) {
+      this.activeGainNode.disconnect();
+      this.activeGainNode = null;
+    }
+  }
+
+  private startWebAudioFromCurrentPositions() {
+    this.stopWebAudioNodes();
+    if (!this.audioCtx || this.tracks.length === 0) return;
+
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {});
+    }
+
+    const audible =
+      this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
+    if (!audible) return;
+
+    // If the audible track is already at its end, rewind to 0 before playing
+    if (audible.currentTime >= audible.source.duration - 0.005) {
+      this.seekToEventFrame(0);
+    }
+
+    for (const track of this.tracks) {
+      track.playStartNativeFrame = track.currentNativeFrame;
+    }
+    this.playStartCtxTime = this.audioCtx.currentTime;
+
+    const sourceNode = this.audioCtx.createBufferSource();
+    sourceNode.buffer = audible.audioBuffer;
+    const gainNode = this.audioCtx.createGain();
+    gainNode.gain.value = 1.0;
+    sourceNode.connect(gainNode);
+    gainNode.connect(this.audioCtx.destination);
+
+    const startOffset = Math.max(
+      0,
+      Math.min(audible.source.duration, audible.currentTime)
+    );
+    sourceNode.start(0, startOffset);
+
+    this.activeSourceNode = sourceNode;
+    this.activeGainNode = gainNode;
+
+    const tick = () => {
+      if (!this.isPlaying || !this.audioCtx || !this.layout) return;
+      const elapsedSec = Math.max(0, this.audioCtx.currentTime - this.playStartCtxTime);
+      const elapsedFrames = elapsedSec * FRAMES_PER_SECOND;
+
+      for (const track of this.tracks) {
+        const trackFrames = Math.round(track.source.duration * FRAMES_PER_SECOND);
+        const maxNative = track.source.startFrame + trackFrames;
+        track.currentNativeFrame = Math.min(
+          maxNative,
+          track.playStartNativeFrame + elapsedFrames
+        );
+        track.currentTime = Math.max(
+          0,
+          Math.min(
+            track.source.duration,
+            (track.currentNativeFrame - track.source.startFrame) / FRAMES_PER_SECOND
+          )
+        );
+      }
+
+      const currentAudible =
+        this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
+      if (currentAudible) {
+        const evFrame = toEventFrame(
+          this.layout,
+          currentAudible.source.timeline,
+          currentAudible.currentNativeFrame
+        );
+        if (evFrame !== null) {
+          const transform =
+            currentAudible.source.timeline === 'render'
+              ? this.renderTransform
+              : IDENTITY_TRANSFORM;
+          this.currentTime = Math.max(
+            0,
+            Math.min(this.duration, toDisplayTime(transform, evFrame) - this.displayStart)
+          );
+        }
+        const maxAudibleNative =
+          currentAudible.source.startFrame +
+          Math.round(currentAudible.source.duration * FRAMES_PER_SECOND);
+        if (currentAudible.currentNativeFrame >= maxAudibleNative) {
+          this.isPlaying = false;
+          this.stopWebAudioNodes();
+          this.drawAllCanvases();
+          return;
+        }
+      }
+
+      this.drawAllCanvases();
+      this.rafId = requestAnimationFrame(tick);
+    };
+
+    this.rafId = requestAnimationFrame(tick);
+  }
+
+  private togglePlay() {
+    if (this.tracks.length === 0) return;
+
+    if (this.isPlaying) {
+      this.isPlaying = false;
+      this.stopWebAudioNodes();
+      return;
+    }
+
+    this.isPlaying = true;
+    this.startWebAudioFromCurrentPositions();
+  }
+
+  private stopAll() {
+    this.isPlaying = false;
+    this.stopWebAudioNodes();
+    if (this.layout && this.tracks.length > 0) {
+      this.seekToEventFrame(0);
+    } else {
+      this.currentTime = 0;
+    }
+  }
+
+  /**
+   * Toggles a track between absolute scale (gain = 1) and filling its lane (gain = 1 / peak).
+   */
+  private toggleGain(id: string) {
+    this.tracks = this.tracks.map((track) => {
+      if (track.id !== id) return track;
+      const nextZoomed = !track.zoomed && track.peak > 0;
+      const gain = nextZoomed ? 1 / track.peak : 1;
+      return { ...track, zoomed: nextZoomed, gain };
+    });
+    this.requestUpdate();
+    this.updateComplete.then(() => this.drawAllCanvases());
+  }
+
+  /** Moves audio output to one track, leaving every cursor where it is. */
+  private setAudibleTrack(id: string) {
+    this.audibleTrackId = id;
+    for (const track of this.tracks) {
+      track.muted = track.id !== id;
+    }
+    if (this.isPlaying) {
+      this.startWebAudioFromCurrentPositions();
+    }
+    this.requestUpdate();
+  }
+
+  private cleanupTracks() {
+    this.stopWebAudioNodes();
+    for (const track of this.tracks) {
       if (track.url) {
         URL.revokeObjectURL(track.url);
         track.url = null;
@@ -543,60 +1567,16 @@ export class AecDumpViewer extends LitElement {
     this.currentTime = 0;
   }
 
-  // Master controls
-  private togglePlay() {
-    if (this.tracks.length === 0) return;
-
-    if (this.isPlaying) {
-      for (const track of this.tracks) track.ws?.pause();
-      this.isPlaying = false;
-      return;
-    }
-    // Every track advances so the cursors stay together, but only the audible
-    // one is unmuted -- summing points in one signal chain is not a mix.
-    for (const track of this.tracks) track.ws?.play();
-    this.isPlaying = true;
-  }
-
-  private stopAll() {
-    for (const track of this.tracks) track.ws?.stop();
-    this.isPlaying = false;
-    this.currentTime = 0;
-  }
-
-  /**
-   * Toggles a track between absolute scale and filling its lane.
-   *
-   * Fit scales by 1/peak, which is what normalization would have done, except
-   * it is asked for rather than applied to every track silently -- and the peak
-   * stays on screen beside it, so a track that needed 30dB of zoom says so.
-   */
-  private toggleGain(id: string) {
-    this.tracks = this.tracks.map((track) => {
-      if (track.id !== id) return track;
-      const gain = track.gain > 1 || track.peak <= 0 ? 1 : 1 / track.peak;
-      track.ws?.setOptions({ barHeight: gain });
-      return { ...track, gain };
-    });
-  }
-
-  /** Moves audio output to one track, leaving every cursor where it is. */
-  private setAudibleTrack(id: string) {
-    this.audibleTrackId = id;
-    for (const track of this.tracks) {
-      track.ws?.setMuted(track.id !== id);
-    }
-  }
-
   private formatTime(seconds: number): string {
-    const min = Math.floor(seconds / 60);
-    const sec = Math.floor(seconds % 60);
-    const ms = Math.floor((seconds % 1) * 100);
+    const safe = Math.max(0, seconds);
+    const min = Math.floor(safe / 60);
+    const sec = Math.floor(safe % 60);
+    const ms = Math.floor((safe % 1) * 100);
     return `${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
   }
 
   override disconnectedCallback() {
     super.disconnectedCallback();
-    this.destroyWaveSurfers();
+    this.cleanupTracks();
   }
 }
