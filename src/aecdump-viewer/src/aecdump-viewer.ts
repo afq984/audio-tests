@@ -40,6 +40,17 @@ export interface TrackTransportFacade {
   getMuted: () => boolean;
 }
 
+interface TrackWaveformCache {
+  key: string;
+  unplayedCanvas: HTMLCanvasElement;
+  playedCanvas: HTMLCanvasElement;
+}
+
+interface OffscreenPlotCache {
+  key: string;
+  canvas: HTMLCanvasElement;
+}
+
 /**
  * One row in the viewer.
  *
@@ -74,9 +85,28 @@ interface UiTrack {
   playStartNativeFrame: number;
   /** True unless this track is the single audible track. */
   muted: boolean;
-  /** Compatibility facade for inspecting per-track clock, duration, and mute state. */
-  ws: TrackTransportFacade;
+  /** Transport facade for inspecting per-track clock, duration, and mute state. */
+  transport: TrackTransportFacade;
+  /** Cached offscreen waveform bitmaps for O(1) cursor redraws. */
+  waveformCache: TrackWaveformCache | null;
   url: string | null;
+}
+
+/**
+ * Maps a capture-timeline marker frame to the event-time axis, snapping
+ * unplaced frames (before the first valid INIT, during a rejected INIT, or
+ * in a zero-capture segment) to the nearest placed slot instead of falling
+ * back to the native frame axis.
+ */
+function snapCaptureToEventFrame(layout: EventTimeLayout, nativeFrame: number): number {
+  const exact = toEventFrame(layout, 'capture', nativeFrame);
+  if (exact !== null) return exact;
+  const runs = layout.captureRuns;
+  if (runs.length === 0) return 0;
+  const next = runs.find((r) => r.nativeStartFrame >= nativeFrame);
+  if (next) return next.eventStartFrame;
+  const last = runs[runs.length - 1];
+  return last.eventStartFrame + last.frameCount;
 }
 
 /** Peak as dBFS, or a dash for digital silence. */
@@ -119,13 +149,18 @@ export class AecDumpViewer extends LitElement {
   private renderTransform: TrackTransform = IDENTITY_TRANSFORM;
   private displayStart = 0;
   private displayEnd = 0;
+  private cursorDisplaySec = 0;
+  private captureNativeFrame = 0;
+  private renderNativeFrame = 0;
+  private driftCache: OffscreenPlotCache | null = null;
+  private seriesCache: OffscreenPlotCache | null = null;
+  private resizeObserver: ResizeObserver | null = null;
 
   private audioCtx: AudioContext | null = null;
   private activeSourceNode: AudioBufferSourceNode | null = null;
   private activeGainNode: GainNode | null = null;
   private playStartCtxTime = 0;
   private rafId: number | null = null;
-  private draggingTimeline: EventStream | null = null;
   private draggingContainer: HTMLElement | null = null;
 
   static override styles = css`
@@ -672,7 +707,7 @@ export class AecDumpViewer extends LitElement {
             ${markers.map((marker) => {
               const evFrame =
                 this.layout !== null
-                  ? (toEventFrame(this.layout, 'capture', marker.frame) ?? marker.frame)
+                  ? snapCaptureToEventFrame(this.layout, marker.frame)
                   : marker.frame;
               const dispSec = toDisplayTime(IDENTITY_TRANSFORM, evFrame);
               const pct = Math.max(2, Math.min(98, ((dispSec - this.displayStart) / span) * 100));
@@ -749,7 +784,7 @@ export class AecDumpViewer extends LitElement {
             </span>
             <span class="legend-item">
               <span class="legend-swatch" style="background: #188038"></span>
-              Stream.drift
+              Stream.drift (samples)
             </span>
           </div>
         </div>
@@ -807,7 +842,7 @@ export class AecDumpViewer extends LitElement {
   private selectMarker(marker: Marker) {
     this.selectedMarker = marker;
     if (this.layout) {
-      const evFrame = toEventFrame(this.layout, 'capture', marker.frame) ?? marker.frame;
+      const evFrame = snapCaptureToEventFrame(this.layout, marker.frame);
       this.seekToEventFrame(evFrame);
     }
   }
@@ -874,13 +909,17 @@ export class AecDumpViewer extends LitElement {
     this.driftAnalyses = analyzeDrift(this.parsedDump.callOrder);
     this.renderTransform = makeTransform(this.renderOffsetMs / 1000);
 
-    const layoutSec = eventFramesToSeconds(this.layout.extentFrames);
+    const layoutSec =
+      this.layout.extentFrames > 0
+        ? eventFramesToSeconds(this.layout.extentFrames)
+        : dumpDuration(this.parsedDump);
     const shiftedSec = layoutSec + this.renderTransform.offsetSeconds;
-    const rawDumpDur = dumpDuration(this.parsedDump);
 
     this.displayStart = Math.min(0, this.renderTransform.offsetSeconds);
-    this.displayEnd = Math.max(layoutSec, shiftedSec, rawDumpDur, 0.01);
+    this.displayEnd = Math.max(layoutSec, shiftedSec, 0.01);
     this.duration = this.displayEnd - this.displayStart;
+    this.driftCache = null;
+    this.seriesCache = null;
   }
 
   /** Builds one row per track the dump actually contains. */
@@ -919,11 +958,12 @@ export class AecDumpViewer extends LitElement {
         currentTime: 0,
         playStartNativeFrame: source.startFrame,
         muted: true,
-        ws: {
+        transport: {
           getCurrentTime: () => uiTrack.currentTime,
           getDuration: () => uiTrack.source.duration,
           getMuted: () => uiTrack.muted,
         },
+        waveformCache: null,
         url,
       };
       return uiTrack;
@@ -943,10 +983,26 @@ export class AecDumpViewer extends LitElement {
       track.muted = track.id !== this.audibleTrackId;
     }
 
+    this.setPositionsForDisplayTime(toDisplayTime(IDENTITY_TRANSFORM, 0), false);
+
     this.requestUpdate();
     await this.updateComplete;
 
     this.drawAllCanvases();
+  }
+
+  private syncPositionsAfterLayoutChange() {
+    if (!this.layout || this.tracks.length === 0) return;
+    const audible = this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
+    const streamNative =
+      audible.source.timeline === 'render' ? this.renderNativeFrame : this.captureNativeFrame;
+    const ev =
+      toEventFrame(this.layout, audible.source.timeline, streamNative) ??
+      snapCaptureToEventFrame(this.layout, Math.round(streamNative));
+    const transform =
+      audible.source.timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
+    const displaySec = toDisplayTime(transform, ev);
+    this.setPositionsForDisplayTime(displaySec, false);
   }
 
   private onLatenessInput(e: Event) {
@@ -954,6 +1010,7 @@ export class AecDumpViewer extends LitElement {
     if (!Number.isFinite(val) || val < 0) return;
     this.allowedLatenessFrames = Math.floor(val);
     this.recomputeLayoutAndBounds();
+    this.syncPositionsAfterLayoutChange();
     this.drawAllCanvases();
   }
 
@@ -962,29 +1019,32 @@ export class AecDumpViewer extends LitElement {
     if (!Number.isFinite(val)) return;
     this.renderOffsetMs = val;
     this.recomputeLayoutAndBounds();
+    this.syncPositionsAfterLayoutChange();
     this.drawAllCanvases();
   }
 
-  private onTimelinePointerDown(e: PointerEvent, timeline: EventStream) {
+  private onTimelinePointerDown(e: PointerEvent, _timeline: EventStream) {
     const container = e.currentTarget as HTMLElement;
     if (!container) return;
     container.setPointerCapture?.(e.pointerId);
-    this.draggingTimeline = timeline;
     this.draggingContainer = container;
 
-    this.seekAtPointer(e.clientX, container, timeline);
+    if (this.isPlaying) {
+      this.stopWebAudioNodes();
+    }
+
+    this.seekAtPointer(e.clientX, container, true);
 
     const onMove = (moveEvent: PointerEvent) => {
-      if (!this.draggingContainer || !this.draggingTimeline) return;
-      this.seekAtPointer(moveEvent.clientX, this.draggingContainer, this.draggingTimeline);
+      if (!this.draggingContainer) return;
+      this.seekAtPointer(moveEvent.clientX, this.draggingContainer, true);
     };
 
     const onUp = (upEvent: PointerEvent) => {
-      if (this.draggingContainer && this.draggingTimeline) {
-        this.seekAtPointer(upEvent.clientX, this.draggingContainer, this.draggingTimeline);
+      if (this.draggingContainer) {
+        this.seekAtPointer(upEvent.clientX, this.draggingContainer, false);
       }
       this.draggingContainer = null;
-      this.draggingTimeline = null;
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
@@ -995,53 +1055,118 @@ export class AecDumpViewer extends LitElement {
     window.addEventListener('pointercancel', onUp);
   }
 
-  private seekAtPointer(clientX: number, container: HTMLElement, timeline: EventStream) {
+  private seekAtPointer(clientX: number, container: HTMLElement, scrubbing = false) {
     if (!this.layout) return;
     const rect = container.getBoundingClientRect();
     if (rect.width <= 0) return;
     const fraction = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     const displaySec = this.displayStart + fraction * (this.displayEnd - this.displayStart);
-    const transform = timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
-    const eventFrame = Math.max(0, displayToEventFrame(transform, displaySec));
-    this.seekToEventFrame(eventFrame);
+    if (scrubbing) {
+      this.setPositionsForDisplayTime(displaySec);
+      this.drawAllCanvases();
+    } else {
+      this.seekToDisplayTime(displaySec);
+    }
   }
 
-  private seekToEventFrame(eventFrame: number) {
+  private findTrackForKindAtNativeFrame(
+    kind: DumpTrack['kind'],
+    streamNative: number
+  ): UiTrack | null {
+    const candidates = this.tracks.filter((t) => t.source.kind === kind);
+    if (candidates.length === 0) return null;
+    for (const track of candidates) {
+      const trackFrames = Math.round(track.source.duration * FRAMES_PER_SECOND);
+      const endFrame = track.source.startFrame + trackFrames;
+      if (streamNative < endFrame) {
+        return track;
+      }
+    }
+    return candidates[candidates.length - 1];
+  }
+
+  /**
+   * Updates both lanes' stream-wide native positions and every track's local
+   * position for a target `displaySec` on `[displayStart, displayEnd]`,
+   * without restarting audio playback.
+   */
+  private setPositionsForDisplayTime(displaySec: number, updateAudibleSegment = true) {
     if (!this.layout) return;
 
-    let primaryResolution: SeekResolution = 'exact';
+    const clampedDisplaySec = Math.max(
+      this.displayStart,
+      Math.min(this.displayEnd, displaySec)
+    );
+    this.cursorDisplaySec = clampedDisplaySec;
+    this.currentTime = Math.max(
+      0,
+      Math.min(this.duration, clampedDisplaySec - this.displayStart)
+    );
+
+    const captureEventFrame = displayToEventFrame(IDENTITY_TRANSFORM, clampedDisplaySec);
+    const renderEventFrame = displayToEventFrame(this.renderTransform, clampedDisplaySec);
+
+    const captureResult = toNativeFrame(this.layout, 'capture', captureEventFrame);
+    const renderResult = toNativeFrame(this.layout, 'render', renderEventFrame);
+
+    this.captureNativeFrame = captureResult.nativeFrame;
+    this.renderNativeFrame = renderResult.nativeFrame;
+
     for (const track of this.tracks) {
-      const result = toNativeFrame(this.layout, track.source.timeline, eventFrame);
+      const streamNative =
+        track.source.timeline === 'render' ? this.renderNativeFrame : this.captureNativeFrame;
       const trackFrames = Math.round(track.source.duration * FRAMES_PER_SECOND);
       const minNative = track.source.startFrame;
-      const maxNative = track.source.startFrame + trackFrames;
-      const clampedNative = Math.max(minNative, Math.min(maxNative, result.nativeFrame));
+      const maxNative = minNative + trackFrames;
+      const clampedNative = Math.max(minNative, Math.min(maxNative, streamNative));
 
       track.currentNativeFrame = clampedNative;
       track.currentTime = Math.max(
         0,
         Math.min(track.source.duration, (clampedNative - minNative) / FRAMES_PER_SECOND)
       );
+    }
 
-      if (track.id === this.audibleTrackId) {
-        primaryResolution = result.resolution;
+    if (updateAudibleSegment && this.audibleTrackId) {
+      const currentAudible = this.tracks.find((t) => t.id === this.audibleTrackId);
+      if (currentAudible) {
+        const streamNative =
+          currentAudible.source.timeline === 'render'
+            ? this.renderNativeFrame
+            : this.captureNativeFrame;
+        const matchingTrack = this.findTrackForKindAtNativeFrame(
+          currentAudible.source.kind,
+          streamNative
+        );
+        if (matchingTrack && matchingTrack.id !== this.audibleTrackId) {
+          this.audibleTrackId = matchingTrack.id;
+          for (const track of this.tracks) {
+            track.muted = track.id !== this.audibleTrackId;
+          }
+        }
       }
     }
 
-    this.seekResolution = primaryResolution;
     const audible = this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
-    const audibleTransform =
-      audible?.source.timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
-    this.currentTime = Math.max(
-      0,
-      Math.min(this.duration, toDisplayTime(audibleTransform, eventFrame) - this.displayStart)
-    );
+    if (audible) {
+      this.seekResolution =
+        audible.source.timeline === 'render'
+          ? renderResult.resolution
+          : captureResult.resolution;
+    }
+  }
 
+  private seekToDisplayTime(displaySec: number) {
+    if (!this.layout) return;
+    this.setPositionsForDisplayTime(displaySec);
     if (this.isPlaying) {
       this.startWebAudioFromCurrentPositions();
     }
-
     this.drawAllCanvases();
+  }
+
+  private seekToEventFrame(eventFrame: number) {
+    this.seekToDisplayTime(toDisplayTime(IDENTITY_TRANSFORM, eventFrame));
   }
 
   private drawAllCanvases() {
@@ -1056,6 +1181,7 @@ export class AecDumpViewer extends LitElement {
     ctx: CanvasRenderingContext2D;
     width: number;
     height: number;
+    dpr: number;
   } | null {
     const canvas = this.shadowRoot?.getElementById(canvasId) as HTMLCanvasElement | null;
     if (!canvas) return null;
@@ -1072,7 +1198,7 @@ export class AecDumpViewer extends LitElement {
     if (!ctx) return null;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
-    return { ctx, width, height };
+    return { ctx, width, height, dpr };
   }
 
   private timeToX(displaySec: number, width: number): number {
@@ -1080,54 +1206,81 @@ export class AecDumpViewer extends LitElement {
     return ((displaySec - this.displayStart) / span) * width;
   }
 
-  private drawTrackCanvas(track: UiTrack) {
-    if (!this.layout) return;
-    const prepared = this.prepareCanvas(`canvas-${track.domId}`, 80);
-    if (!prepared) return;
-    const { ctx, width, height } = prepared;
-    const midY = height / 2;
+  private ensureTrackWaveformCache(
+    track: UiTrack,
+    width: number,
+    height: number,
+    dpr: number
+  ): TrackWaveformCache {
+    const key = [
+      width,
+      height,
+      dpr,
+      this.allowedLatenessFrames,
+      this.renderOffsetMs,
+      this.displayStart,
+      this.displayEnd,
+      track.gain,
+    ].join(':');
+    if (track.waveformCache && track.waveformCache.key === key) {
+      return track.waveformCache;
+    }
 
+    const createLayer = () => {
+      const c = document.createElement('canvas');
+      c.width = Math.round(width * dpr);
+      c.height = Math.round(height * dpr);
+      const cctx = c.getContext('2d')!;
+      cctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return { canvas: c, ctx: cctx };
+    };
+
+    const unplayed = createLayer();
+    const played = createLayer();
+    const midY = height / 2;
     const transform =
       track.source.timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
 
-    // Zero baseline
-    ctx.strokeStyle = '#eceff1';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, midY);
-    ctx.lineTo(width, midY);
-    ctx.stroke();
+    for (const layerCtx of [unplayed.ctx, played.ctx]) {
+      // Zero baseline
+      layerCtx.strokeStyle = '#eceff1';
+      layerCtx.lineWidth = 1;
+      layerCtx.beginPath();
+      layerCtx.moveTo(0, midY);
+      layerCtx.lineTo(width, midY);
+      layerCtx.stroke();
 
-    // 1. Draw structural EventTimeGaps on this lane
-    for (const gap of this.layout.gaps) {
-      if (gap.stream !== track.source.timeline) continue;
-      const x0 = this.timeToX(toDisplayTime(transform, gap.eventStartFrame), width);
-      const x1 = this.timeToX(toDisplayTime(transform, gap.eventEndFrame), width);
-      const gx = Math.max(0, Math.min(width, x0));
-      const gw = Math.max(2, Math.min(width - gx, x1 - x0));
+      // 1. Draw structural EventTimeGaps on this lane
+      for (const gap of this.layout!.gaps) {
+        if (gap.stream !== track.source.timeline) continue;
+        const x0 = this.timeToX(toDisplayTime(transform, gap.eventStartFrame), width);
+        const x1 = this.timeToX(toDisplayTime(transform, gap.eventEndFrame), width);
+        const gx = Math.max(0, Math.min(width, x0));
+        const gw = Math.max(2, Math.min(width - gx, x1 - x0));
 
-      ctx.fillStyle = 'rgba(217, 48, 37, 0.10)';
-      ctx.fillRect(gx, 0, gw, height);
+        layerCtx.fillStyle = 'rgba(217, 48, 37, 0.10)';
+        layerCtx.fillRect(gx, 0, gw, height);
 
-      // Diagonal hatching
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(gx, 0, gw, height);
-      ctx.clip();
-      ctx.strokeStyle = 'rgba(217, 48, 37, 0.28)';
-      ctx.lineWidth = 1;
-      for (let h = -height; h < gw + height; h += 8) {
-        ctx.beginPath();
-        ctx.moveTo(gx + h, 0);
-        ctx.lineTo(gx + h - height, height);
-        ctx.stroke();
-      }
-      ctx.restore();
+        // Diagonal hatching
+        layerCtx.save();
+        layerCtx.beginPath();
+        layerCtx.rect(gx, 0, gw, height);
+        layerCtx.clip();
+        layerCtx.strokeStyle = 'rgba(217, 48, 37, 0.28)';
+        layerCtx.lineWidth = 1;
+        for (let h = -height; h < gw + height; h += 8) {
+          layerCtx.beginPath();
+          layerCtx.moveTo(gx + h, 0);
+          layerCtx.lineTo(gx + h - height, height);
+          layerCtx.stroke();
+        }
+        layerCtx.restore();
 
-      if (gw >= 36) {
-        ctx.fillStyle = '#b0251a';
-        ctx.font = '10px monospace';
-        ctx.fillText(`gap ${gap.observedLagFrames * FRAME_MS}ms`, gx + 4, 12);
+        if (gw >= 36) {
+          layerCtx.fillStyle = '#b0251a';
+          layerCtx.font = '10px monospace';
+          layerCtx.fillText(`gap ${gap.observedLagFrames * FRAME_MS}ms`, gx + 4, 12);
+        }
       }
     }
 
@@ -1139,17 +1292,10 @@ export class AecDumpViewer extends LitElement {
     const channels = track.source.channelData;
     const totalSamples = channels[0]?.length ?? 0;
 
-    const cursorEventFrame = toEventFrame(
-      this.layout,
-      track.source.timeline,
-      track.currentNativeFrame
-    );
-    const cursorX =
-      cursorEventFrame !== null
-        ? this.timeToX(toDisplayTime(transform, cursorEventFrame), width)
-        : -1;
+    unplayed.ctx.fillStyle = '#8ab4f8';
+    played.ctx.fillStyle = '#1a73e8';
 
-    const runs = runsFor(this.layout, track.source.timeline);
+    const runs = runsFor(this.layout!, track.source.timeline);
     for (const run of runs) {
       const nativeStart = Math.max(run.nativeStartFrame, trackStartFrame);
       const nativeEnd = Math.min(run.nativeStartFrame + run.frameCount, trackEndFrame);
@@ -1193,14 +1339,70 @@ export class AecDumpViewer extends LitElement {
         const scaledMax = Math.max(-1, Math.min(1, maxVal * track.gain));
         const yTop = midY - scaledMax * (midY - 2);
         const yBot = midY - scaledMin * (midY - 2);
+        const barH = Math.max(1.5, yBot - yTop);
 
-        ctx.fillStyle = px <= cursorX ? '#1a73e8' : '#8ab4f8';
-        ctx.fillRect(px, yTop, 1, Math.max(1.5, yBot - yTop));
+        unplayed.ctx.fillRect(px, yTop, 1, barH);
+        played.ctx.fillRect(px, yTop, 1, barH);
       }
     }
 
-    // 3. Draw synchronized vertical cursor
-    if (cursorX >= 0 && cursorX <= width) {
+    const cache: TrackWaveformCache = {
+      key,
+      unplayedCanvas: unplayed.canvas,
+      playedCanvas: played.canvas,
+    };
+    track.waveformCache = cache;
+    return cache;
+  }
+
+  private drawTrackCanvas(track: UiTrack) {
+    if (!this.layout) return;
+    const prepared = this.prepareCanvas(`canvas-${track.domId}`, 80);
+    if (!prepared) return;
+    const { ctx, width, height, dpr } = prepared;
+    const cache = this.ensureTrackWaveformCache(track, width, height, dpr);
+
+    const transform =
+      track.source.timeline === 'render' ? this.renderTransform : IDENTITY_TRANSFORM;
+    const streamNative =
+      track.source.timeline === 'render' ? this.renderNativeFrame : this.captureNativeFrame;
+    const trackFrameCount = Math.round(track.source.duration * FRAMES_PER_SECOND);
+    const trackStartFrame = track.source.startFrame;
+    const trackEndFrame = trackStartFrame + trackFrameCount;
+
+    const cursorEventFrame = toEventFrame(this.layout, track.source.timeline, streamNative);
+    const cursorX =
+      cursorEventFrame !== null
+        ? this.timeToX(toDisplayTime(transform, cursorEventFrame), width)
+        : -1;
+
+    if (cursorX <= 0) {
+      ctx.drawImage(cache.unplayedCanvas, 0, 0, width, height);
+    } else if (cursorX >= width) {
+      ctx.drawImage(cache.playedCanvas, 0, 0, width, height);
+    } else {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, cursorX, height);
+      ctx.clip();
+      ctx.drawImage(cache.playedCanvas, 0, 0, width, height);
+      ctx.restore();
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(cursorX, 0, width - cursorX, height);
+      ctx.clip();
+      ctx.drawImage(cache.unplayedCanvas, 0, 0, width, height);
+      ctx.restore();
+    }
+
+    // 3. Draw synchronized vertical cursor when the stream position is within this track's segment
+    if (
+      streamNative >= trackStartFrame &&
+      streamNative <= trackEndFrame &&
+      cursorX >= 0 &&
+      cursorX <= width
+    ) {
       ctx.strokeStyle = '#202124';
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -1210,29 +1412,51 @@ export class AecDumpViewer extends LitElement {
     }
   }
 
-  private drawDriftCanvas() {
-    if (!this.layout || !this.parsedDump) return;
-    const prepared = this.prepareCanvas('canvas-drift', 110);
-    if (!prepared) return;
-    const { ctx, width, height } = prepared;
+  private ensureDriftPlotCache(width: number, height: number, dpr: number): HTMLCanvasElement {
+    const key = [
+      width,
+      height,
+      dpr,
+      this.allowedLatenessFrames,
+      this.renderOffsetMs,
+      this.displayStart,
+      this.displayEnd,
+    ].join(':');
+    if (this.driftCache && this.driftCache.key === key) {
+      return this.driftCache.canvas;
+    }
 
-    const allDriftPoints = this.driftAnalyses.flatMap((a) => a.points);
-    const delaySeries = this.parsedDump.series.delay;
-    const delayPresent = this.parsedDump.series.delayPresent;
-    const driftSeries = this.parsedDump.series.drift;
-    const driftPresent = this.parsedDump.series.driftPresent;
+    const offscreen = document.createElement('canvas');
+    offscreen.width = Math.round(width * dpr);
+    offscreen.height = Math.round(height * dpr);
+    const bctx = offscreen.getContext('2d')!;
+    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const delaySeries = this.parsedDump!.series.delay;
+    const delayPresent = this.parsedDump!.series.delayPresent;
+    const driftSeries = this.parsedDump!.series.drift;
+    const driftPresent = this.parsedDump!.series.driftPresent;
 
     let minY = -20;
     let maxY = 60;
-    for (const p of allDriftPoints) {
-      if (p.driftMs < minY) minY = p.driftMs;
-      if (p.driftMs > maxY) maxY = p.driftMs;
+    for (const analysis of this.driftAnalyses) {
+      for (const p of analysis.points) {
+        if (p.driftMs < minY) minY = p.driftMs;
+        if (p.driftMs > maxY) maxY = p.driftMs;
+      }
     }
     if (delaySeries && delayPresent) {
       for (let i = 0; i < delaySeries.length; i++) {
         if (!delayPresent[i]) continue;
         if (delaySeries[i] < minY) minY = delaySeries[i];
         if (delaySeries[i] > maxY) maxY = delaySeries[i];
+      }
+    }
+    if (driftSeries && driftPresent) {
+      for (let i = 0; i < driftSeries.length; i++) {
+        if (!driftPresent[i]) continue;
+        if (driftSeries[i] < minY) minY = driftSeries[i];
+        if (driftSeries[i] > maxY) maxY = driftSeries[i];
       }
     }
     const pad = Math.max(10, (maxY - minY) * 0.1);
@@ -1244,80 +1468,107 @@ export class AecDumpViewer extends LitElement {
 
     // Zero line
     const zeroY = valToY(0);
-    ctx.strokeStyle = '#dadce0';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, zeroY);
-    ctx.lineTo(width, zeroY);
-    ctx.stroke();
+    bctx.strokeStyle = '#dadce0';
+    bctx.lineWidth = 1;
+    bctx.beginPath();
+    bctx.moveTo(0, zeroY);
+    bctx.lineTo(width, zeroY);
+    bctx.stroke();
 
-    // Plot cumulative call-order drift (ms)
-    if (allDriftPoints.length > 0) {
-      ctx.strokeStyle = '#d93025';
-      ctx.lineWidth = 1.75;
-      ctx.beginPath();
-      let started = false;
-      for (const p of allDriftPoints) {
-        const ev = toEventFrame(this.layout, 'capture', p.captureFrame) ?? p.captureFrame;
-        const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
-        const y = valToY(p.driftMs);
-        if (!started) {
-          ctx.moveTo(x, y);
-          started = true;
-        } else {
-          ctx.lineTo(x, y);
+    // Plot cumulative call-order drift (ms), lifting pen across INIT segment boundaries
+    if (this.driftAnalyses.some((a) => a.points.length > 0)) {
+      bctx.strokeStyle = '#d93025';
+      bctx.lineWidth = 1.75;
+      bctx.beginPath();
+      for (const analysis of this.driftAnalyses) {
+        let started = false;
+        for (const p of analysis.points) {
+          const ev = toEventFrame(this.layout!, 'capture', p.captureFrame);
+          if (ev === null) {
+            started = false;
+            continue;
+          }
+          const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
+          const y = valToY(p.driftMs);
+          if (!started) {
+            bctx.moveTo(x, y);
+            started = true;
+          } else {
+            bctx.lineTo(x, y);
+          }
         }
       }
-      ctx.stroke();
+      bctx.stroke();
     }
 
     // Plot Stream.delay (ms)
     if (delaySeries && delayPresent) {
-      ctx.strokeStyle = '#1a73e8';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
+      bctx.strokeStyle = '#1a73e8';
+      bctx.lineWidth = 1.5;
+      bctx.beginPath();
       let penDown = false;
       for (let i = 0; i < delaySeries.length; i++) {
         if (delayPresent[i] !== 1) {
           penDown = false;
           continue;
         }
-        const ev = toEventFrame(this.layout, 'capture', i) ?? i;
+        const ev = toEventFrame(this.layout!, 'capture', i);
+        if (ev === null) {
+          penDown = false;
+          continue;
+        }
         const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
         const y = valToY(delaySeries[i]);
         if (!penDown) {
-          ctx.moveTo(x, y);
+          bctx.moveTo(x, y);
           penDown = true;
         } else {
-          ctx.lineTo(x, y);
+          bctx.lineTo(x, y);
         }
       }
-      ctx.stroke();
+      bctx.stroke();
     }
 
-    // Plot Stream.drift if present
+    // Plot Stream.drift (samples) if present
     if (driftSeries && driftPresent) {
-      ctx.strokeStyle = '#188038';
-      ctx.lineWidth = 1.25;
-      ctx.beginPath();
+      bctx.strokeStyle = '#188038';
+      bctx.lineWidth = 1.25;
+      bctx.beginPath();
       let penDown = false;
       for (let i = 0; i < driftSeries.length; i++) {
         if (driftPresent[i] !== 1) {
           penDown = false;
           continue;
         }
-        const ev = toEventFrame(this.layout, 'capture', i) ?? i;
+        const ev = toEventFrame(this.layout!, 'capture', i);
+        if (ev === null) {
+          penDown = false;
+          continue;
+        }
         const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
         const y = valToY(driftSeries[i]);
         if (!penDown) {
-          ctx.moveTo(x, y);
+          bctx.moveTo(x, y);
           penDown = true;
         } else {
-          ctx.lineTo(x, y);
+          bctx.lineTo(x, y);
         }
       }
-      ctx.stroke();
+      bctx.stroke();
     }
+
+    this.driftCache = { key, canvas: offscreen };
+    return offscreen;
+  }
+
+  private drawDriftCanvas() {
+    if (!this.layout || !this.parsedDump) return;
+    const prepared = this.prepareCanvas('canvas-drift', 110);
+    if (!prepared) return;
+    const { ctx, width, height, dpr } = prepared;
+
+    const bg = this.ensureDriftPlotCache(width, height, dpr);
+    ctx.drawImage(bg, 0, 0, width, height);
 
     // Draw shared cursor
     const cursorX = this.timeToX(this.displayStart + this.currentTime, width);
@@ -1331,50 +1582,82 @@ export class AecDumpViewer extends LitElement {
     }
   }
 
-  private drawSeriesCanvas() {
-    if (!this.layout || !this.parsedDump) return;
-    const prepared = this.prepareCanvas('canvas-series', 80);
-    if (!prepared) return;
-    const { ctx, width, height } = prepared;
+  private ensureSeriesPlotCache(width: number, height: number, dpr: number): HTMLCanvasElement {
+    const key = [
+      width,
+      height,
+      dpr,
+      this.allowedLatenessFrames,
+      this.renderOffsetMs,
+      this.displayStart,
+      this.displayEnd,
+    ].join(':');
+    if (this.seriesCache && this.seriesCache.key === key) {
+      return this.seriesCache.canvas;
+    }
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = Math.round(width * dpr);
+    offscreen.height = Math.round(height * dpr);
+    const bctx = offscreen.getContext('2d')!;
+    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const { appliedInputVolume, appliedInputVolumePresent, keypress, keypressPresent } =
-      this.parsedDump.series;
+      this.parsedDump!.series;
 
     if (keypress && keypressPresent) {
-      ctx.fillStyle = 'rgba(242, 153, 0, 0.25)';
+      bctx.fillStyle = 'rgba(242, 153, 0, 0.25)';
       for (let i = 0; i < keypress.length; i++) {
         if (keypressPresent[i] === 1 && keypress[i] === 1) {
-          const ev0 = toEventFrame(this.layout, 'capture', i) ?? i;
+          const ev0 = toEventFrame(this.layout!, 'capture', i);
+          if (ev0 === null) continue;
           const x0 = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev0), width);
           const x1 = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev0 + 1), width);
-          ctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
+          bctx.fillRect(x0, 0, Math.max(2, x1 - x0), height);
         }
       }
     }
 
     if (appliedInputVolume && appliedInputVolumePresent) {
-      ctx.strokeStyle = '#9334e6';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
+      bctx.strokeStyle = '#9334e6';
+      bctx.lineWidth = 1.5;
+      bctx.beginPath();
       let penDown = false;
       for (let i = 0; i < appliedInputVolume.length; i++) {
         if (appliedInputVolumePresent[i] !== 1) {
           penDown = false;
           continue;
         }
-        const ev = toEventFrame(this.layout, 'capture', i) ?? i;
+        const ev = toEventFrame(this.layout!, 'capture', i);
+        if (ev === null) {
+          penDown = false;
+          continue;
+        }
         const x = this.timeToX(toDisplayTime(IDENTITY_TRANSFORM, ev), width);
         const norm = Math.max(0, Math.min(1, appliedInputVolume[i] / 255));
         const y = height - 8 - norm * (height - 16);
         if (!penDown) {
-          ctx.moveTo(x, y);
+          bctx.moveTo(x, y);
           penDown = true;
         } else {
-          ctx.lineTo(x, y);
+          bctx.lineTo(x, y);
         }
       }
-      ctx.stroke();
+      bctx.stroke();
     }
+
+    this.seriesCache = { key, canvas: offscreen };
+    return offscreen;
+  }
+
+  private drawSeriesCanvas() {
+    if (!this.layout || !this.parsedDump) return;
+    const prepared = this.prepareCanvas('canvas-series', 80);
+    if (!prepared) return;
+    const { ctx, width, height, dpr } = prepared;
+
+    const bg = this.ensureSeriesPlotCache(width, height, dpr);
+    ctx.drawImage(bg, 0, 0, width, height);
 
     const cursorX = this.timeToX(this.displayStart + this.currentTime, width);
     if (cursorX >= 0 && cursorX <= width) {
@@ -1394,14 +1677,15 @@ export class AecDumpViewer extends LitElement {
       this.rafId = null;
     }
     if (this.activeSourceNode) {
+      const node = this.activeSourceNode;
+      this.activeSourceNode = null;
       try {
-        this.activeSourceNode.onended = null;
-        this.activeSourceNode.stop();
+        node.onended = null;
+        node.stop();
       } catch {
         // Ignore if already stopped
       }
-      this.activeSourceNode.disconnect();
-      this.activeSourceNode = null;
+      node.disconnect();
     }
     if (this.activeGainNode) {
       this.activeGainNode.disconnect();
@@ -1417,13 +1701,32 @@ export class AecDumpViewer extends LitElement {
       this.audioCtx.resume().catch(() => {});
     }
 
-    const audible =
+    let audible =
       this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
     if (!audible) return;
 
-    // If the audible track is already at its end, rewind to 0 before playing
+    // If the audible track is at its end, either advance to the next segment of
+    // the same kind or rewind to the start of the dump without re-entering
+    // startWebAudioFromCurrentPositions().
     if (audible.currentTime >= audible.source.duration - 0.005) {
-      this.seekToEventFrame(0);
+      const nextTrack = this.tracks.find(
+        (t) =>
+          t.source.kind === audible.source.kind &&
+          t.source.initIndex > audible.source.initIndex &&
+          t.currentTime < t.source.duration - 0.005
+      );
+      if (nextTrack) {
+        this.audibleTrackId = nextTrack.id;
+        for (const track of this.tracks) {
+          track.muted = track.id !== this.audibleTrackId;
+        }
+        audible = nextTrack;
+      } else {
+        this.setPositionsForDisplayTime(this.displayStart);
+        audible =
+          this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
+        if (!audible) return;
+      }
     }
 
     for (const track of this.tracks) {
@@ -1442,6 +1745,13 @@ export class AecDumpViewer extends LitElement {
       0,
       Math.min(audible.source.duration, audible.currentTime)
     );
+    let sourceEnded = false;
+    sourceNode.onended = () => {
+      if (this.activeSourceNode === sourceNode && this.isPlaying) {
+        sourceEnded = true;
+        tick();
+      }
+    };
     sourceNode.start(0, startOffset);
 
     this.activeSourceNode = sourceNode;
@@ -1449,52 +1759,85 @@ export class AecDumpViewer extends LitElement {
 
     const tick = () => {
       if (!this.isPlaying || !this.audioCtx || !this.layout) return;
-      const elapsedSec = Math.max(0, this.audioCtx.currentTime - this.playStartCtxTime);
-      const elapsedFrames = elapsedSec * FRAMES_PER_SECOND;
-
-      for (const track of this.tracks) {
-        const trackFrames = Math.round(track.source.duration * FRAMES_PER_SECOND);
-        const maxNative = track.source.startFrame + trackFrames;
-        track.currentNativeFrame = Math.min(
-          maxNative,
-          track.playStartNativeFrame + elapsedFrames
-        );
-        track.currentTime = Math.max(
-          0,
-          Math.min(
-            track.source.duration,
-            (track.currentNativeFrame - track.source.startFrame) / FRAMES_PER_SECOND
-          )
-        );
-      }
-
       const currentAudible =
         this.tracks.find((t) => t.id === this.audibleTrackId) ?? this.tracks[0];
-      if (currentAudible) {
-        const evFrame = toEventFrame(
-          this.layout,
-          currentAudible.source.timeline,
-          currentAudible.currentNativeFrame
-        );
-        if (evFrame !== null) {
-          const transform =
-            currentAudible.source.timeline === 'render'
-              ? this.renderTransform
-              : IDENTITY_TRANSFORM;
-          this.currentTime = Math.max(
+      if (!currentAudible) return;
+
+      const elapsedSec = Math.max(0, this.audioCtx.currentTime - this.playStartCtxTime);
+      const elapsedFrames = elapsedSec * FRAMES_PER_SECOND;
+      const audibleFrames = Math.round(currentAudible.source.duration * FRAMES_PER_SECOND);
+      const maxAudibleNative = currentAudible.source.startFrame + audibleFrames;
+      const nextAudibleNative = sourceEnded
+        ? maxAudibleNative
+        : Math.min(maxAudibleNative, currentAudible.playStartNativeFrame + elapsedFrames);
+
+      const evFrame = toEventFrame(
+        this.layout,
+        currentAudible.source.timeline,
+        nextAudibleNative
+      );
+      if (evFrame !== null) {
+        const transform =
+          currentAudible.source.timeline === 'render'
+            ? this.renderTransform
+            : IDENTITY_TRANSFORM;
+        const displaySec = toDisplayTime(transform, evFrame);
+        this.setPositionsForDisplayTime(displaySec, false);
+      } else {
+        if (currentAudible.source.timeline === 'render') {
+          this.renderNativeFrame = nextAudibleNative;
+        } else {
+          this.captureNativeFrame = nextAudibleNative;
+        }
+        for (const track of this.tracks) {
+          const streamNative =
+            track.source.timeline === 'render' ? this.renderNativeFrame : this.captureNativeFrame;
+          const trackFrames = Math.round(track.source.duration * FRAMES_PER_SECOND);
+          const minNative = track.source.startFrame;
+          const maxNative = minNative + trackFrames;
+          const clampedNative = Math.max(minNative, Math.min(maxNative, streamNative));
+          track.currentNativeFrame = clampedNative;
+          track.currentTime = Math.max(
             0,
-            Math.min(this.duration, toDisplayTime(transform, evFrame) - this.displayStart)
+            Math.min(track.source.duration, (clampedNative - minNative) / FRAMES_PER_SECOND)
           );
         }
-        const maxAudibleNative =
-          currentAudible.source.startFrame +
-          Math.round(currentAudible.source.duration * FRAMES_PER_SECOND);
-        if (currentAudible.currentNativeFrame >= maxAudibleNative) {
-          this.isPlaying = false;
-          this.stopWebAudioNodes();
+      }
+
+      if (nextAudibleNative >= maxAudibleNative) {
+        const nextTrack = this.tracks.find(
+          (t) =>
+            t.source.kind === currentAudible.source.kind &&
+            t.source.initIndex > currentAudible.source.initIndex
+        );
+        if (nextTrack) {
+          this.audibleTrackId = nextTrack.id;
+          for (const track of this.tracks) {
+            track.muted = track.id !== nextTrack.id;
+          }
+          const nextEv = toEventFrame(
+            this.layout,
+            nextTrack.source.timeline,
+            nextTrack.source.startFrame
+          );
+          if (nextEv !== null) {
+            const transform =
+              nextTrack.source.timeline === 'render'
+                ? this.renderTransform
+                : IDENTITY_TRANSFORM;
+            this.setPositionsForDisplayTime(toDisplayTime(transform, nextEv), false);
+          }
+          nextTrack.currentNativeFrame = nextTrack.source.startFrame;
+          nextTrack.currentTime = 0;
+          this.requestUpdate();
           this.drawAllCanvases();
+          this.startWebAudioFromCurrentPositions();
           return;
         }
+        this.isPlaying = false;
+        this.stopWebAudioNodes();
+        this.drawAllCanvases();
+        return;
       }
 
       this.drawAllCanvases();
@@ -1521,7 +1864,7 @@ export class AecDumpViewer extends LitElement {
     this.isPlaying = false;
     this.stopWebAudioNodes();
     if (this.layout && this.tracks.length > 0) {
-      this.seekToEventFrame(0);
+      this.seekToDisplayTime(this.displayStart);
     } else {
       this.currentTime = 0;
     }
@@ -1535,7 +1878,7 @@ export class AecDumpViewer extends LitElement {
       if (track.id !== id) return track;
       const nextZoomed = !track.zoomed && track.peak > 0;
       const gain = nextZoomed ? 1 / track.peak : 1;
-      return { ...track, zoomed: nextZoomed, gain };
+      return { ...track, zoomed: nextZoomed, gain, waveformCache: null };
     });
     this.requestUpdate();
     this.updateComplete.then(() => this.drawAllCanvases());
@@ -1560,11 +1903,17 @@ export class AecDumpViewer extends LitElement {
         URL.revokeObjectURL(track.url);
         track.url = null;
       }
+      track.waveformCache = null;
     }
     this.tracks = [];
+    this.driftCache = null;
+    this.seriesCache = null;
     this.isPlaying = false;
     this.duration = 0;
     this.currentTime = 0;
+    this.cursorDisplaySec = 0;
+    this.captureNativeFrame = 0;
+    this.renderNativeFrame = 0;
   }
 
   private formatTime(seconds: number): string {
@@ -1575,8 +1924,28 @@ export class AecDumpViewer extends LitElement {
     return `${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
   }
 
+  override connectedCallback() {
+    super.connectedCallback();
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        if (this.tracks.length > 0) {
+          this.drawAllCanvases();
+        }
+      });
+      this.resizeObserver.observe(this);
+    }
+  }
+
   override disconnectedCallback() {
     super.disconnectedCallback();
+    if (this.resizeObserver) {
+      this.resizeObserver.disconnect();
+      this.resizeObserver = null;
+    }
     this.cleanupTracks();
+    if (this.audioCtx) {
+      void this.audioCtx.close().catch(() => {});
+      this.audioCtx = null;
+    }
   }
 }
